@@ -1,0 +1,20 @@
+# Сборка PyInstaller
+/build/
+/dist/
+*.spec
+
+# Сборочное venv
+/.venv-build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Логи/настройки приложения (на случай локальной отладки рядом с кодом)
+*.log
+settings.json
+
+# Локальные bat-скрипты (сборка/служебные) — в репозиторий не публикуются
+*.bat
