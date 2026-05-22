@@ -15,7 +15,8 @@ APP_WINDOW_CLASS = "DNSManagerMainWindow"
 
 # ── GeoHide ──────────────────────────────────────────────────────────────────
 GEOHIDE_DOMAIN = "dns.geohide.ru"
-GEOHIDE_FALLBACK_IPS = ["45.131.7.1", "45.131.7.2"]
+GEOHIDE_FALLBACK_IPS = ["45.155.204.190", "37.230.192.51"]
+GEOHIDE_LEGACY_FALLBACK_IPS = ["45.131.7.1", "45.131.7.2"]
 
 # ── DNS-профили по умолчанию ─────────────────────────────────────────────────
 # Применяется при первом запуске, при сбросе DNS-кнопок к стандартному набору
@@ -23,20 +24,61 @@ GEOHIDE_FALLBACK_IPS = ["45.131.7.1", "45.131.7.2"]
 # приоритетным. Тип «geohide» — служебный: соответствующий профиль динамически
 # резолвится через dns.geohide.ru, остальные («static») применяются как есть.
 DEFAULT_DNS_PROFILES = [
-    {"id": "geohide",    "name": "GeoHide",    "type": "geohide", "primary": "45.131.7.1",     "secondary": "45.131.7.2"},
-    {"id": "cloudflare", "name": "Cloudflare", "type": "static",  "primary": "1.1.1.1",        "secondary": "1.0.0.1"},
-    {"id": "adguard",    "name": "AdGuard",    "type": "static",  "primary": "94.140.14.14",   "secondary": "94.140.15.15"},
-    {"id": "xbox_dns",   "name": "Xbox-dns",   "type": "static",  "primary": "176.99.11.77",   "secondary": "80.78.247.254"},
-    {"id": "malw_link",  "name": "MalwareDefender", "type": "static",  "primary": "84.21.189.133",  "secondary": "193.23.209.189"},
-    {"id": "mafioznik",  "name": "MFZ",             "type": "static",  "primary": "103.27.157.38",  "secondary": "103.27.157.100"},
-    {"id": "astracat",   "name": "Astracat",   "type": "static",  "primary": "185.139.69.24",  "secondary": "77.239.113.0"},
-    {"id": "comss",      "name": "Comss",      "type": "static",  "primary": "83.220.169.155", "secondary": "212.109.195.93"},
+    {
+        "id": "geohide", "name": "GeoHide", "type": "geohide",
+        "primary": "45.155.204.190", "secondary": "37.230.192.51",
+        "source_url": "https://status.dns.geohide.ru/",
+        "fetch_url": "dns.geohide.ru",
+    },
+    {
+        "id": "xbox_dns", "name": "Xbox-dns", "type": "static",
+        "primary": "176.99.11.77", "secondary": "80.78.247.254",
+        "source_url": "https://t.me/s/xbox_dns",
+        "fetch_url": "",
+    },
+    {
+        "id": "comss", "name": "Comss", "type": "static",
+        "primary": "83.220.169.155", "secondary": "212.109.195.93",
+        "source_url": "https://www.comss.ru/page.php?id=7315",
+        "fetch_url": "",
+    },
+    {
+        "id": "cloudflare", "name": "Cloudflare", "type": "static",
+        "primary": "1.1.1.1", "secondary": "1.0.0.1",
+        "source_url": "https://one.one.one.one/dns/",
+        "fetch_url": "",
+    },
+    {
+        "id": "adguard", "name": "AdGuard", "type": "static",
+        "primary": "94.140.14.14", "secondary": "94.140.15.15",
+        "source_url": "https://adguard-dns.io/en/public-dns.html",
+        "fetch_url": "dns.adguard-dns.com",
+    },
+    {
+        "id": "malw_link", "name": "MalwareDefender", "type": "static",
+        "primary": "84.21.189.133", "secondary": "193.23.209.189",
+        "source_url": "https://info.dns.malw.link/",
+        "fetch_url": "https://info.dns.malw.link/",
+    },
+    {
+        "id": "mafioznik", "name": "MFZ", "type": "static",
+        "primary": "103.27.157.38", "secondary": "103.27.157.100",
+        "source_url": "https://dns.mafioznik.xyz/",
+        "fetch_url": "dns.mafioznik.xyz",
+    },
+    {
+        "id": "astracat", "name": "Astracat", "type": "static",
+        "primary": "185.139.69.24", "secondary": "77.239.113.0",
+        "source_url": "https://github.com/ASTRACAT2022/AstracatDNS",
+        "fetch_url": "",
+    },
 ]
 
 DEFAULT_DNS_BUTTONS_PER_ROW = 4
 
 # ── Проверка DNS ─────────────────────────────────────────────────────────────
 TEST_DOMAIN = "google.com"
+DNS_PROFILE_TEST_DOMAIN = "chatgpt.com"
 DNS_RESOLVE_TIMEOUT = 5
 
 # Сериализация доступа к socket.setdefaulttimeout: getaddrinfo не принимает

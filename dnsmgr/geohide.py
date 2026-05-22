@@ -33,7 +33,11 @@ def resolve_geohide():
     """Резолвит dns.geohide.ru в IP-адреса. Возвращает (ips, used_fallback)."""
     try:
         results = socket.getaddrinfo(GEOHIDE_DOMAIN, None, socket.AF_INET, socket.SOCK_DGRAM)
-        ips = list(set(r[4][0] for r in results))
+        ips = []
+        for r in results:
+            ip = r[4][0]
+            if ip not in ips:
+                ips.append(ip)
         if ips:
             app_logger.info(f"Резолв {GEOHIDE_DOMAIN} -> {', '.join(ips)}")
             return ips, False

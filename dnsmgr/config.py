@@ -11,6 +11,7 @@ import json
 from dnsmgr.constants import (
     DEFAULT_DNS_BUTTONS_PER_ROW,
     DEFAULT_DNS_PROFILES,
+    GEOHIDE_LEGACY_FALLBACK_IPS,
     HEALTH_CHECK_INTERVAL,
     HEALTH_CHECK_INTERVAL_MIN,
     SETTINGS_PATH,
@@ -66,6 +67,40 @@ def _get_default_dns_profiles():
     return [dict(p) for p in DEFAULT_DNS_PROFILES]
 
 
+def _default_profile_map():
+    return {p["id"]: dict(p) for p in DEFAULT_DNS_PROFILES}
+
+
+def _apply_default_profile_migrations(profiles):
+    """Добавляет новые поля дефолтных профилей и обновляет устаревшие fallback."""
+    defaults = _default_profile_map()
+    migrated = []
+    for profile in profiles:
+        p = dict(profile)
+        default = defaults.get(p.get("id"))
+        if default:
+            if not p.get("source_url"):
+                p["source_url"] = default.get("source_url", "")
+            if not p.get("fetch_url"):
+                p["fetch_url"] = default.get("fetch_url", "")
+            if p.get("id") == "geohide":
+                legacy_pair = (
+                    GEOHIDE_LEGACY_FALLBACK_IPS[0],
+                    GEOHIDE_LEGACY_FALLBACK_IPS[1],
+                )
+                current_pair = (default.get("primary", ""), default.get("secondary", ""))
+                if (p.get("primary"), p.get("secondary", "")) == legacy_pair:
+                    p["primary"], p["secondary"] = current_pair
+        migrated.append(p)
+
+    ids = [p.get("id") for p in migrated]
+    default_order = [p["id"] for p in DEFAULT_DNS_PROFILES]
+    if len(ids) == len(default_order) and set(ids) == set(default_order):
+        by_id = {p["id"]: p for p in migrated}
+        return [by_id[pid] for pid in default_order]
+    return migrated
+
+
 def _sanitize_dns_profiles(profiles):
     """Валидирует и нормализует загруженный список DNS-профилей.
 
@@ -115,13 +150,15 @@ def _sanitize_dns_profiles(profiles):
             "type": ptype,
             "primary": primary,
             "secondary": str(raw.get("secondary") or "").strip(),
+            "source_url": str(raw.get("source_url") or "").strip(),
+            "fetch_url": str(raw.get("fetch_url") or "").strip(),
         })
     # Если исходный список был непустой, но все элементы оказались
     # мусорными — это повреждённые данные, а не намеренная очистка.
     # Возвращаем None, чтобы вызывающая сторона подставила дефолт.
     if not cleaned:
         return None
-    return cleaned
+    return _apply_default_profile_migrations(cleaned)
 
 
 def load_settings():

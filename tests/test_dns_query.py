@@ -12,6 +12,7 @@ from unittest.mock import patch
 from dnsmgr.network import (
     _encode_dns_query,
     _normalize_domain,
+    _parse_curl_http_code,
     _parse_http_status_line,
     _parse_dns_response,
     _skip_dns_name,
@@ -178,6 +179,14 @@ class ParseHttpStatusLineTest(unittest.TestCase):
 
     def test_garbage_returns_none(self):
         self.assertIsNone(_parse_http_status_line("not http"))
+
+
+class ParseCurlHttpCodeTest(unittest.TestCase):
+    def test_valid_code(self):
+        self.assertEqual(_parse_curl_http_code("200"), 200)
+
+    def test_ignores_curl_zero_code(self):
+        self.assertIsNone(_parse_curl_http_code("000"))
 
 
 class ClassifyHttpStatusTest(unittest.TestCase):

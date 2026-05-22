@@ -414,7 +414,7 @@ def detect_dns_mode(dns_servers, geohide_known_ips=None, is_dhcp=False, dns_prof
          расширенному множеству — считаем профиль активным.
       4. Иначе — DNS не соответствует ни одной кнопке приложения.
     """
-    from dnsmgr.constants import GEOHIDE_FALLBACK_IPS
+    from dnsmgr.constants import GEOHIDE_FALLBACK_IPS, GEOHIDE_LEGACY_FALLBACK_IPS
 
     # 1. DHCP / нет данных → стандартный DNS.
     if is_dhcp or not dns_servers:
@@ -433,7 +433,7 @@ def detect_dns_mode(dns_servers, geohide_known_ips=None, is_dhcp=False, dns_prof
             return (profile["id"], profile["name"])
 
     # 3. Geohide: допускаем подмножество с учётом динамически резолвленных IP.
-    geohide_extra = set(_norm_ip(x) for x in GEOHIDE_FALLBACK_IPS)
+    geohide_extra = set(_norm_ip(x) for x in GEOHIDE_FALLBACK_IPS + GEOHIDE_LEGACY_FALLBACK_IPS)
     if geohide_known_ips:
         geohide_extra.update(_norm_ip(x) for x in geohide_known_ips)
     for profile in profiles:
@@ -821,6 +821,17 @@ def _parse_http_status_line(line):
     return None
 
 
+def _parse_curl_http_code(text):
+    """Извлекает статус из stdout curl -w '%{http_code}'. Чистая функция."""
+    m = re.search(r"(\d{3})\s*$", text or "")
+    if not m:
+        return None
+    status = int(m.group(1))
+    if 100 <= status <= 599:
+        return status
+    return None
+
+
 def classify_http_status(status):
     """status:int|None -> 'open' | 'geoblock' | 'error'."""
     if status is None:
@@ -856,6 +867,61 @@ def _format_http_probe_error(exc):
     return str(exc) or exc.__class__.__name__
 
 
+def _curl_executable():
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    system_curl = os.path.join(system_root, "System32", "curl.exe")
+    if os.path.exists(system_curl):
+        return system_curl
+    return "curl.exe"
+
+
+def _curl_probe_via_ip(ip, domain, path, timeout, insecure=False):
+    """Уточняющая HTTPS-проба через системный curl.exe с --resolve."""
+    if timeout < 1.0:
+        return {"status": None, "error": "таймаут", "tls_unverified": insecure}
+    try:
+        url = f"https://{domain}{path}"
+        cmd = [
+            _curl_executable(),
+            "--http1.1",
+            "--silent",
+            "--connect-timeout", f"{min(timeout, 5.0):.1f}",
+            "--max-time", f"{timeout:.1f}",
+            "--resolve", f"{domain}:443:{ip}",
+            "-o", os.devnull,
+            "-w", "%{http_code}",
+            "-H", f"User-Agent: {LINK_FETCH_USER_AGENT}",
+            "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "-H", "Accept-Language: ru,en;q=0.9",
+            url,
+        ]
+        if insecure:
+            cmd.insert(1, "--insecure")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout + 1.0,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except FileNotFoundError:
+        return {"status": None, "error": "curl.exe недоступен", "tls_unverified": insecure}
+    except subprocess.TimeoutExpired:
+        return {"status": None, "error": "таймаут", "tls_unverified": insecure}
+    except Exception as e:
+        return {"status": None, "error": str(e), "tls_unverified": insecure}
+
+    stdout = result.stdout.decode("ascii", errors="replace")
+    status = _parse_curl_http_code(stdout)
+    if status is not None and result.returncode == 0:
+        return {"status": status, "error": None, "tls_unverified": insecure}
+    stderr = result.stderr.decode("utf-8", errors="replace").strip()
+    return {
+        "status": None,
+        "error": stderr or f"curl exit {result.returncode}",
+        "tls_unverified": insecure,
+    }
+
+
 def http_probe_via_ip(ip, domain, timeout=5.0, path="/"):
     """HTTPS-запрос к конкретному IP с TLS SNI и заголовком Host = domain.
 
@@ -887,11 +953,48 @@ def http_probe_via_ip(ip, domain, timeout=5.0, path="/"):
         f"GET {request_path} HTTP/1.1\r\n"
         f"Host: {host_header}\r\n"
         f"User-Agent: {LINK_FETCH_USER_AGENT}\r\n"
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+        "Accept-Language: ru,en;q=0.9\r\n"
         "Connection: close\r\n"
-        "Accept: */*\r\n"
+        "Upgrade-Insecure-Requests: 1\r\n"
         "\r\n"
     ).encode("ascii", errors="replace")
     deadline = time.monotonic() + timeout
+
+    def _maybe_refine_with_curl(result):
+        # У Cloudflare Python/OpenSSL-запрос может получать bot challenge 403,
+        # хотя Windows/curl-запрос к тому же IP проходит. Уточняем только 403,
+        # чтобы не делать обычную проверку тяжелее.
+        if result.get("status") != 403:
+            return result
+        try:
+            remaining = _remaining_probe_timeout(deadline)
+        except socket.timeout:
+            return result
+        curl_result = _curl_probe_via_ip(
+            ip,
+            host_header,
+            request_path,
+            remaining,
+            insecure=bool(result.get("tls_unverified")),
+        )
+        if curl_result.get("status") is not None:
+            return curl_result
+        if not result.get("tls_unverified"):
+            try:
+                remaining = _remaining_probe_timeout(deadline)
+            except socket.timeout:
+                return result
+            curl_result = _curl_probe_via_ip(
+                ip,
+                host_header,
+                request_path,
+                remaining,
+                insecure=True,
+            )
+            if curl_result.get("status") is not None:
+                return curl_result
+        return result
 
     def _request_once(verify_cert):
         raw_sock = None
@@ -936,10 +1039,10 @@ def http_probe_via_ip(ip, domain, timeout=5.0, path="/"):
                         pass
 
     try:
-        return _request_once(verify_cert=True)
+        return _maybe_refine_with_curl(_request_once(verify_cert=True))
     except ssl.SSLCertVerificationError:
         try:
-            return _request_once(verify_cert=False)
+            return _maybe_refine_with_curl(_request_once(verify_cert=False))
         except Exception as e:
             return {
                 "status": None,

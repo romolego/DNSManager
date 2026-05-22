@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from datetime import datetime
 from tkinter import messagebox, ttk
 
@@ -38,9 +39,11 @@ from dnsmgr.config import (
 from dnsmgr.constants import (
     APP_NAME,
     DEFAULT_DNS_BUTTONS_PER_ROW,
+    DNS_PROFILE_TEST_DOMAIN,
     DNS_APPLY_SETTLE_DELAY,
     GEOHIDE_DOMAIN,
     GEOHIDE_FALLBACK_IPS,
+    GEOHIDE_LEGACY_FALLBACK_IPS,
     HEALTH_CHECK_INTERVAL_MIN,
     INTERNET_WAIT_INTERVAL,
     INTERNET_WAIT_TIMEOUT,
@@ -99,13 +102,95 @@ def create_tray_icon_image(size=64):
 
 class DNSManagerApp(tk.Tk):
 
+    @staticmethod
+    def _enable_entry_clipboard_shortcuts(widget):
+        """Явные Ctrl/Ctrl+Shift shortcut'ы для Entry при любой раскладке."""
+        def _has_selection(w):
+            try:
+                w.index("sel.first")
+                w.index("sel.last")
+                return True
+            except tk.TclError:
+                return False
+
+        def _is_editable(w):
+            try:
+                state = str(w.cget("state"))
+            except tk.TclError:
+                return True
+            return state not in ("disabled", "readonly")
+
+        def _copy(event):
+            try:
+                selected = event.widget.selection_get()
+                event.widget.clipboard_clear()
+                event.widget.clipboard_append(selected)
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _paste(event):
+            if not _is_editable(event.widget):
+                return "break"
+            try:
+                text = event.widget.clipboard_get()
+            except tk.TclError:
+                return "break"
+            try:
+                if _has_selection(event.widget):
+                    event.widget.delete("sel.first", "sel.last")
+                event.widget.insert("insert", text)
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _cut(event):
+            if not _is_editable(event.widget):
+                return "break"
+            _copy(event)
+            try:
+                if _has_selection(event.widget):
+                    event.widget.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _select_all(event):
+            try:
+                event.widget.selection_range(0, "end")
+                event.widget.icursor("end")
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _on_key(event):
+            ctrl = bool(event.state & 0x4)
+            shift = bool(event.state & 0x1)
+            keysym = (event.keysym or "").lower()
+            keycode = event.keycode
+            if ctrl and (keysym in ("v", "м") or keycode == 86):
+                return _paste(event)
+            if shift and keysym == "insert":
+                return _paste(event)
+            if ctrl and (keysym in ("c", "с") or keycode == 67):
+                return _copy(event)
+            if ctrl and (keysym in ("x", "ч") or keycode == 88):
+                return _cut(event)
+            if ctrl and (keysym in ("a", "ф") or keycode == 65):
+                return _select_all(event)
+            return None
+
+        widget.bind("<KeyPress>", _on_key)
+        return widget
+
     def __init__(self, start_hidden=False):
         super().__init__()
 
         self.settings = load_settings()
-        self.geohide_known_ips = list(set(
-            GEOHIDE_FALLBACK_IPS + self.settings.get("geohide_resolved_ips", [])
-        ))
+        self.geohide_known_ips = []
+        for ip in GEOHIDE_FALLBACK_IPS + self.settings.get("geohide_resolved_ips", []):
+            if ip and ip not in self.geohide_known_ips:
+                self.geohide_known_ips.append(ip)
         self._dns_profiles = self.settings.get("dns_profiles", _get_default_dns_profiles())
         self.adapters = []
         self.current_adapter = None
@@ -485,6 +570,7 @@ class DNSManagerApp(tk.Tk):
             row=0, column=0, sticky=tk.W, pady=1
         )
         ent_threshold = ttk.Entry(mon_frame, textvariable=self.var_failure_threshold, width=6)
+        self._enable_entry_clipboard_shortcuts(ent_threshold)
         ent_threshold.grid(row=0, column=1, sticky=tk.W, padx=(6, 0))
         ent_threshold.bind("<FocusOut>", self._on_failure_threshold_change)
         ent_threshold.bind("<Return>", self._on_failure_threshold_change)
@@ -493,6 +579,7 @@ class DNSManagerApp(tk.Tk):
             row=1, column=0, sticky=tk.W, pady=1
         )
         ent_interval = ttk.Entry(mon_frame, textvariable=self.var_health_check_interval, width=6)
+        self._enable_entry_clipboard_shortcuts(ent_interval)
         ent_interval.grid(row=1, column=1, sticky=tk.W, padx=(6, 0))
         ent_interval.bind("<FocusOut>", self._on_health_check_interval_change)
         ent_interval.bind("<Return>", self._on_health_check_interval_change)
@@ -2431,8 +2518,8 @@ class DNSManagerApp(tk.Tk):
         """Открывает модальное окно настройки DNS-профилей."""
         dialog = tk.Toplevel(self)
         dialog.title("Настройка DNS-кнопок")
-        dialog.geometry("700x560")
-        dialog.minsize(600, 450)
+        dialog.geometry("940x580")
+        dialog.minsize(900, 500)
         dialog.resizable(True, True)
         dialog.transient(self)
         dialog.grab_set()
@@ -2448,13 +2535,14 @@ class DNSManagerApp(tk.Tk):
         test_results = {}        # profile_id -> (text, color)
         result_labels = {}       # profile_id -> ttk.Label (живёт между перестроениями)
         test_state = {"busy": False}
-        var_test_domain = tk.StringVar(value="google.com")
+        var_test_domain = tk.StringVar(value=DNS_PROFILE_TEST_DOMAIN)
 
         # ── Кнопок в ряду ──
         bpr_frame = ttk.Frame(dialog)
         bpr_frame.pack(fill=tk.X, padx=15, pady=(12, 6))
         ttk.Label(bpr_frame, text="Кнопок в ряду:").pack(side=tk.LEFT)
         bpr_spin = ttk.Spinbox(bpr_frame, from_=1, to=5, width=4, textvariable=work_bpr)
+        self._enable_entry_clipboard_shortcuts(bpr_spin)
         bpr_spin.pack(side=tk.LEFT, padx=(6, 0))
 
         # ── Панель проверки DNS: время отклика + откроется ли домен ──
@@ -2462,6 +2550,7 @@ class DNSManagerApp(tk.Tk):
         test_frame.pack(fill=tk.X, padx=15, pady=(0, 4))
         ttk.Label(test_frame, text="Проверить домен:").pack(side=tk.LEFT)
         ent_test_domain = ttk.Entry(test_frame, textvariable=var_test_domain, width=22)
+        self._enable_entry_clipboard_shortcuts(ent_test_domain)
         ent_test_domain.pack(side=tk.LEFT, padx=(6, 6))
         btn_test = ttk.Button(test_frame, text="Проверить")
         btn_test.pack(side=tk.LEFT)
@@ -2525,11 +2614,11 @@ class DNSManagerApp(tk.Tk):
             # geohide-профиля — пометка ★, приоритетной (быстрой) кнопки — ⚡,
             # обе у названия, чтобы не ломать выравнивание блока кнопок.
             list_frame.columnconfigure(0, minsize=30)    # #
-            list_frame.columnconfigure(1, minsize=160)   # Название
-            list_frame.columnconfigure(2, minsize=125)   # Основной DNS
-            list_frame.columnconfigure(3, minsize=125)   # Резервный DNS
-            list_frame.columnconfigure(4, minsize=185, weight=1)  # Результат
-            list_frame.columnconfigure(5, minsize=110)   # Кнопки
+            list_frame.columnconfigure(1, minsize=170)   # Название
+            list_frame.columnconfigure(2, minsize=135)   # Основной DNS
+            list_frame.columnconfigure(3, minsize=135)   # Резервный DNS
+            list_frame.columnconfigure(4, minsize=270, weight=1)  # Результат
+            list_frame.columnconfigure(5, minsize=120)   # Кнопки
 
             # ── Заголовок ──
             ttk.Label(list_frame, text="#", font=bold).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
@@ -2630,12 +2719,27 @@ class DNSManagerApp(tk.Tk):
 
             ed = tk.Toplevel(dialog)
             ed.title("Добавить профиль" if is_new else "Редактировать профиль")
-            ed.geometry("520x440")
-            ed.minsize(480, 420)
+            ed.geometry("640x520")
+            ed.minsize(600, 500)
             ed.resizable(True, False)
             ed.transient(dialog)
             ed.grab_set()
             ed.configure(bg="#f5f5f5")
+
+            def _default_source_url(profile):
+                return _default_profile_field(profile, "source_url")
+
+            def _default_fetch_url(profile):
+                return _default_profile_field(profile, "fetch_url")
+
+            def _default_profile_field(profile, field):
+                pid = profile.get("id")
+                if not pid:
+                    return ""
+                for default_profile in _get_default_dns_profiles():
+                    if default_profile.get("id") == pid:
+                        return default_profile.get(field, "")
+                return ""
 
             var_name = tk.StringVar(value=p["name"])
             # Тип скрыт от пользователя как явное поле: «geohide» — служебный
@@ -2644,7 +2748,8 @@ class DNSManagerApp(tk.Tk):
             # редактировании существующего geohide-профиля тип сохраняется
             # неизменным и показывается только как информационная пометка.
             existing_type = p.get("type", "static") or "static"
-            var_link = tk.StringVar(value="")
+            var_source_url = tk.StringVar(value=p.get("source_url") or _default_source_url(p))
+            var_link = tk.StringVar(value=p.get("fetch_url") or _default_fetch_url(p))
             var_primary = tk.StringVar(value=p.get("primary", ""))
             var_secondary = tk.StringVar(value=p.get("secondary", ""))
 
@@ -2656,9 +2761,64 @@ class DNSManagerApp(tk.Tk):
 
             # ── Название ──
             ttk.Label(fr, text="Название:").grid(row=grid_row, column=0, sticky=tk.W, pady=4)
-            ttk.Entry(fr, textvariable=var_name, width=36).grid(
-                row=grid_row, column=1, sticky=tk.EW, pady=4)
+            ent_name = ttk.Entry(fr, textvariable=var_name, width=36)
+            self._enable_entry_clipboard_shortcuts(ent_name)
+            ent_name.grid(row=grid_row, column=1, sticky=tk.EW, pady=4)
             grid_row += 1
+
+            # ── Официальная страница с актуальными DNS ──
+            ttk.Label(fr, text="Где смотреть DNS:").grid(row=grid_row, column=0, sticky=tk.W, pady=4)
+            source_row = ttk.Frame(fr)
+            source_row.grid(row=grid_row, column=1, sticky=tk.EW, pady=4)
+            source_row.columnconfigure(0, weight=1)
+            ent_source = ttk.Entry(source_row, textvariable=var_source_url, width=34)
+            self._enable_entry_clipboard_shortcuts(ent_source)
+            ent_source.grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
+            btn_copy_source = ttk.Button(source_row, text="Копировать")
+            btn_copy_source.grid(row=0, column=1, sticky=tk.E, padx=(0, 6))
+            btn_open_source = ttk.Button(source_row, text="Открыть")
+            btn_open_source.grid(row=0, column=2, sticky=tk.E)
+            grid_row += 1
+
+            source_actions_fr = ttk.Frame(fr)
+            source_actions_fr.grid(row=grid_row, column=0, columnspan=2, sticky=tk.W, pady=(0, 2))
+            lbl_source_status = ttk.Label(
+                source_actions_fr, text="", foreground="#555", font=("Segoe UI", 9)
+            )
+            lbl_source_status.pack(side=tk.LEFT)
+            grid_row += 1
+
+            def _normalized_source_url():
+                url = var_source_url.get().strip()
+                if url and not url.lower().startswith(("http://", "https://")):
+                    url = "https://" + url
+                return url
+
+            def _copy_source_url():
+                url = _normalized_source_url()
+                if not url:
+                    lbl_source_status.configure(text="Ссылка не указана", foreground="#c0392b")
+                    return
+                try:
+                    ed.clipboard_clear()
+                    ed.clipboard_append(url)
+                    lbl_source_status.configure(text="Ссылка скопирована", foreground="#2a7d2a")
+                except tk.TclError:
+                    lbl_source_status.configure(text="Не удалось скопировать", foreground="#c0392b")
+
+            def _open_source_url():
+                url = _normalized_source_url()
+                if not url:
+                    lbl_source_status.configure(text="Ссылка не указана", foreground="#c0392b")
+                    return
+                try:
+                    webbrowser.open(url)
+                    lbl_source_status.configure(text="Открыто в браузере", foreground="#2a7d2a")
+                except Exception as e:
+                    lbl_source_status.configure(text=f"Не удалось открыть: {e}", foreground="#c0392b")
+
+            btn_copy_source.configure(command=_copy_source_url)
+            btn_open_source.configure(command=_open_source_url)
 
             # ── Информационная пометка для служебного geohide-профиля ──
             # Это не выбор типа, а просто подсказка, что профиль обновляется
@@ -2684,6 +2844,7 @@ class DNSManagerApp(tk.Tk):
             link_row.grid(row=grid_row, column=1, sticky=tk.EW, pady=4)
             link_row.columnconfigure(0, weight=1)
             ent_link = ttk.Entry(link_row, textvariable=var_link, width=26)
+            self._enable_entry_clipboard_shortcuts(ent_link)
             ent_link.grid(row=0, column=0, sticky=tk.EW, padx=(0, 8))
             btn_fetch = ttk.Button(link_row, text="Получить DNS по ссылке")
             btn_fetch.grid(row=0, column=1, sticky=tk.E)
@@ -2703,13 +2864,15 @@ class DNSManagerApp(tk.Tk):
 
             # ── DNS-поля (всегда доступны для ручного ввода/правки) ──
             ttk.Label(fr, text="Основной DNS:").grid(row=grid_row, column=0, sticky=tk.W, pady=4)
-            ttk.Entry(fr, textvariable=var_primary, width=36).grid(
-                row=grid_row, column=1, sticky=tk.EW, pady=4)
+            ent_primary = ttk.Entry(fr, textvariable=var_primary, width=36)
+            self._enable_entry_clipboard_shortcuts(ent_primary)
+            ent_primary.grid(row=grid_row, column=1, sticky=tk.EW, pady=4)
             grid_row += 1
 
             ttk.Label(fr, text="Резервный DNS:").grid(row=grid_row, column=0, sticky=tk.W, pady=4)
-            ttk.Entry(fr, textvariable=var_secondary, width=36).grid(
-                row=grid_row, column=1, sticky=tk.EW, pady=4)
+            ent_secondary = ttk.Entry(fr, textvariable=var_secondary, width=36)
+            self._enable_entry_clipboard_shortcuts(ent_secondary)
+            ent_secondary.grid(row=grid_row, column=1, sticky=tk.EW, pady=4)
             grid_row += 1
 
             lbl_err = ttk.Label(fr, text="", foreground="#c0392b", font=("Segoe UI", 9))
@@ -2835,6 +2998,8 @@ class DNSManagerApp(tk.Tk):
                     "type": ptype,
                     "primary": primary,
                     "secondary": secondary,
+                    "source_url": var_source_url.get().strip(),
+                    "fetch_url": var_link.get().strip(),
                 }
 
                 if is_new:
@@ -2889,17 +3054,27 @@ class DNSManagerApp(tk.Tk):
                     pass
 
         def _test_ip_for_profile(profile):
-            """IP, по которому проверять профиль. Для geohide берём актуальный
-            резолв dns.geohide.ru (geohide_known_ips), а не статичный резерв в
-            таблице — иначе устаревший адрес даёт ложный таймаут."""
-            if profile.get("type") == "geohide" and self.geohide_known_ips:
-                return self.geohide_known_ips[0] or profile.get("primary", "")
+            """IP, по которому проверять профиль.
+
+            Для geohide сначала берём явно сохранённый не-резервный primary
+            из таблицы, чтобы пользователь видел и проверял один и тот же IP.
+            Если в таблице только дефолтный резерв, используем актуальный
+            резолв dns.geohide.ru.
+            """
+            if profile.get("type") == "geohide":
+                primary = profile.get("primary", "")
+                fallback_ips = set(GEOHIDE_FALLBACK_IPS) | set(GEOHIDE_LEGACY_FALLBACK_IPS)
+                if primary and primary not in fallback_ips:
+                    return primary
+                if self.geohide_known_ips:
+                    return self.geohide_known_ips[0]
+                return primary
             return profile.get("primary", "")
 
         def _run_test():
             if test_state["busy"]:
                 return
-            domain = var_test_domain.get().strip() or "google.com"
+            domain = var_test_domain.get().strip() or DNS_PROFILE_TEST_DOMAIN
             snapshot = [(p["id"], _test_ip_for_profile(p)) for p in work_profiles]
             snapshot = [(pid, ip) for pid, ip in snapshot if ip]
             if not snapshot:

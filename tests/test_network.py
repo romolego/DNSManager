@@ -7,7 +7,13 @@ from dnsmgr.network import _norm_ip, _profile_ip_set, detect_dns_mode
 
 CF = {"id": "cf", "name": "Cloudflare", "type": "static", "primary": "1.1.1.1", "secondary": "1.0.0.1"}
 ADG = {"id": "adg", "name": "AdGuard", "type": "static", "primary": "94.140.14.14", "secondary": "94.140.15.15"}
-GEO = {"id": "geohide", "name": "GeoHide", "type": "geohide", "primary": "45.131.7.1", "secondary": "45.131.7.2"}
+GEO = {
+    "id": "geohide",
+    "name": "GeoHide",
+    "type": "geohide",
+    "primary": "45.155.204.190",
+    "secondary": "37.230.192.51",
+}
 PROFILES = [GEO, CF, ADG]
 
 
@@ -59,6 +65,12 @@ class DetectDnsModeTest(unittest.TestCase):
 
     def test_geohide_fallback_ips_match(self):
         # Захардкоженные резервы GeoHide распознаются как geohide.
+        pid, _ = detect_dns_mode(["45.155.204.190", "37.230.192.51"], dns_profiles=PROFILES)
+        self.assertEqual(pid, "geohide")
+
+    def test_geohide_legacy_fallback_ips_still_match(self):
+        # Старые fallback-адреса распознаются как geohide, чтобы приложение
+        # могло корректно мигрировать уже применённый DNS.
         pid, _ = detect_dns_mode(["45.131.7.1", "45.131.7.2"], dns_profiles=PROFILES)
         self.assertEqual(pid, "geohide")
 

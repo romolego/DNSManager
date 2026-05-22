@@ -31,7 +31,14 @@ class SanitizeDnsProfilesTest(unittest.TestCase):
 
     def test_valid_profile_normalized(self):
         result = _sanitize_dns_profiles([
-            {"id": "cf", "name": "  Cloudflare ", "primary": " 1.1.1.1 ", "secondary": "1.0.0.1"}
+            {
+                "id": "cf",
+                "name": "  Cloudflare ",
+                "primary": " 1.1.1.1 ",
+                "secondary": "1.0.0.1",
+                "source_url": " https://one.one.one.one/dns/ ",
+                "fetch_url": " one.one.one.one ",
+            }
         ])
         self.assertEqual(len(result), 1)
         p = result[0]
@@ -40,6 +47,8 @@ class SanitizeDnsProfilesTest(unittest.TestCase):
         self.assertEqual(p["primary"], "1.1.1.1")     # обрезаны пробелы
         self.assertEqual(p["secondary"], "1.0.0.1")
         self.assertEqual(p["type"], "static")          # дефолтный тип
+        self.assertEqual(p["source_url"], "https://one.one.one.one/dns/")
+        self.assertEqual(p["fetch_url"], "one.one.one.one")
 
     def test_unknown_type_coerced_to_static(self):
         result = _sanitize_dns_profiles([
@@ -93,6 +102,50 @@ class DefaultDnsProfilesTest(unittest.TestCase):
     def test_first_profile_is_geohide(self):
         profiles = _get_default_dns_profiles()
         self.assertEqual(profiles[0]["type"], "geohide")
+
+    def test_default_profile_order(self):
+        profiles = _get_default_dns_profiles()
+        self.assertEqual(
+            [p["id"] for p in profiles],
+            [
+                "geohide",
+                "xbox_dns",
+                "comss",
+                "cloudflare",
+                "adguard",
+                "malw_link",
+                "mafioznik",
+                "astracat",
+            ],
+        )
+
+    def test_geohide_defaults(self):
+        profile = _get_default_dns_profiles()[0]
+        self.assertEqual(profile["primary"], "45.155.204.190")
+        self.assertEqual(profile["secondary"], "37.230.192.51")
+        self.assertTrue(profile["source_url"].startswith("https://"))
+        self.assertEqual(profile["fetch_url"], "dns.geohide.ru")
+
+    def test_legacy_default_profiles_are_migrated(self):
+        old_profiles = [
+            {"id": "geohide", "name": "GeoHide", "type": "geohide", "primary": "45.131.7.1", "secondary": "45.131.7.2"},
+            {"id": "cloudflare", "name": "Cloudflare", "type": "static", "primary": "1.1.1.1", "secondary": "1.0.0.1"},
+            {"id": "adguard", "name": "AdGuard", "type": "static", "primary": "94.140.14.14", "secondary": "94.140.15.15"},
+            {"id": "xbox_dns", "name": "Xbox-dns", "type": "static", "primary": "176.99.11.77", "secondary": "80.78.247.254"},
+            {"id": "malw_link", "name": "MalwareDefender", "type": "static", "primary": "84.21.189.133", "secondary": "193.23.209.189"},
+            {"id": "mafioznik", "name": "MFZ", "type": "static", "primary": "103.27.157.38", "secondary": "103.27.157.100"},
+            {"id": "astracat", "name": "Astracat", "type": "static", "primary": "185.139.69.24", "secondary": "77.239.113.0"},
+            {"id": "comss", "name": "Comss", "type": "static", "primary": "83.220.169.155", "secondary": "212.109.195.93"},
+        ]
+
+        migrated = _sanitize_dns_profiles(old_profiles)
+
+        self.assertEqual([p["id"] for p in migrated[:3]], ["geohide", "xbox_dns", "comss"])
+        self.assertEqual(migrated[0]["primary"], "45.155.204.190")
+        self.assertEqual(migrated[0]["secondary"], "37.230.192.51")
+        self.assertTrue(all(p.get("source_url") for p in migrated))
+        self.assertEqual(migrated[0]["fetch_url"], "dns.geohide.ru")
+        self.assertEqual(migrated[4]["fetch_url"], "dns.adguard-dns.com")
 
 
 class GetProfileByIdTest(unittest.TestCase):

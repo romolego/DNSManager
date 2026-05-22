@@ -7,7 +7,7 @@ from dnsmgr.geohide import _is_valid_public_ipv4, _normalize_link_input
 
 class IsValidPublicIpv4Test(unittest.TestCase):
     def test_valid_public(self):
-        for ip in ("8.8.8.8", "1.1.1.1", "45.131.7.1", "94.140.14.14", "203.0.114.1"):
+        for ip in ("8.8.8.8", "1.1.1.1", "45.155.204.190", "94.140.14.14", "203.0.114.1"):
             self.assertTrue(_is_valid_public_ipv4(ip), ip)
 
     def test_private_ranges_rejected(self):
