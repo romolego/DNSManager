@@ -9,9 +9,9 @@
     `get_dhcp_offered_dns`);
   - проверку готовности сети и реального интернета (NCSI-пробы);
   - распознавание текущего режима DNS (`detect_dns_mode`);
-  - адресный DNS-запрос к конкретному серверу для замера времени отклика и
-    проверки, резолвит ли этот сервер заданный домен (`dns_query`,
-    `check_resource_via_dns`).
+  - адресный DNS-запрос к конкретному серверу для замера времени отклика,
+    проверки, резолвит ли этот сервер заданный домен, и HTTPS-пробу по
+    конкретному IP с правильным SNI/Host (`dns_query`, `check_resource_via_dns`).
 
 Зависит только от constants и logger.
 """
@@ -20,12 +20,14 @@ import json
 import os
 import re
 import socket
+import ssl
 import struct
 import subprocess
 import time
 
 from dnsmgr.constants import (
     DNS_RESOLVE_TIMEOUT,
+    LINK_FETCH_USER_AGENT,
     NETWORK_NO_CONNECTION,
     NETWORK_READY,
     NETWORK_UNSTABLE,
@@ -805,20 +807,151 @@ def dns_query(dns_ip, domain, timeout=2.5, retries=1):
     return {"ok": False, "latency_ms": None, "ips": [], "error": last_err}
 
 
-def _tcp_connect_ok(ip, port, timeout=2.0):
-    """True, если до ip:port удаётся установить TCP-соединение."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
+def _parse_http_status_line(line):
+    """Извлекает HTTP-статус из первой строки ответа. Чистая функция."""
+    if isinstance(line, bytes):
+        line = line.decode("iso-8859-1", errors="replace")
+    line = (line or "").strip()
+    m = re.match(r"^HTTP/\d(?:\.\d)?\s+(\d{3})(?:\s|$)", line)
+    if not m:
+        return None
+    status = int(m.group(1))
+    if 100 <= status <= 599:
+        return status
+    return None
+
+
+def classify_http_status(status):
+    """status:int|None -> 'open' | 'geoblock' | 'error'."""
+    if status is None:
+        return "error"
     try:
-        sock.connect((ip, port))
-        return True
+        status = int(status)
+    except (TypeError, ValueError):
+        return "error"
+    if status in (403, 451):
+        return "geoblock"
+    if 200 <= status <= 399 or status == 401:
+        return "open"
+    return "error"
+
+
+def _remaining_probe_timeout(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise socket.timeout("таймаут")
+    return max(0.001, remaining)
+
+
+def _format_http_probe_error(exc):
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "таймаут"
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        msg = getattr(exc, "verify_message", None) or str(exc)
+        return f"tls verify: {msg}"
+    if isinstance(exc, ssl.SSLError):
+        return f"tls: {exc}"
+    if isinstance(exc, ConnectionResetError):
+        return "connection reset"
+    return str(exc) or exc.__class__.__name__
+
+
+def http_probe_via_ip(ip, domain, timeout=5.0, path="/"):
+    """HTTPS-запрос к конкретному IP с TLS SNI и заголовком Host = domain.
+
+    Возвращает:
+        {"status": int|None, "error": str|None, "tls_unverified": bool}
+    """
+    domain = _normalize_domain(domain)
+    if not ip:
+        return {"status": None, "error": "пустой IP", "tls_unverified": False}
+    if not domain:
+        return {"status": None, "error": "пустой домен", "tls_unverified": False}
+
+    try:
+        host_header = domain.encode("idna").decode("ascii")
+    except UnicodeError:
+        host_header = domain
+
+    path = path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if "\r" in path or "\n" in path:
+        path = "/"
+    try:
+        request_path = path.encode("ascii", errors="ignore").decode("ascii") or "/"
     except Exception:
-        return False
-    finally:
+        request_path = "/"
+
+    request = (
+        f"GET {request_path} HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        f"User-Agent: {LINK_FETCH_USER_AGENT}\r\n"
+        "Connection: close\r\n"
+        "Accept: */*\r\n"
+        "\r\n"
+    ).encode("ascii", errors="replace")
+    deadline = time.monotonic() + timeout
+
+    def _request_once(verify_cert):
+        raw_sock = None
+        tls_sock = None
         try:
-            sock.close()
-        except Exception:
-            pass
+            raw_sock = socket.create_connection(
+                (ip, 443),
+                timeout=_remaining_probe_timeout(deadline),
+            )
+            raw_sock.settimeout(_remaining_probe_timeout(deadline))
+            ctx = ssl.create_default_context()
+            if not verify_cert:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            tls_sock = ctx.wrap_socket(raw_sock, server_hostname=host_header)
+            raw_sock = None
+            tls_sock.settimeout(_remaining_probe_timeout(deadline))
+            tls_sock.sendall(request)
+
+            data = b""
+            while b"\n" not in data and len(data) < 4096:
+                tls_sock.settimeout(_remaining_probe_timeout(deadline))
+                chunk = tls_sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            status_line = data.split(b"\n", 1)[0].rstrip(b"\r")
+            status = _parse_http_status_line(status_line)
+            if status is None:
+                return {
+                    "status": None,
+                    "error": "неверный HTTP-ответ",
+                    "tls_unverified": not verify_cert,
+                }
+            return {"status": status, "error": None, "tls_unverified": not verify_cert}
+        finally:
+            for s in (tls_sock, raw_sock):
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+    try:
+        return _request_once(verify_cert=True)
+    except ssl.SSLCertVerificationError:
+        try:
+            return _request_once(verify_cert=False)
+        except Exception as e:
+            return {
+                "status": None,
+                "error": _format_http_probe_error(e),
+                "tls_unverified": True,
+            }
+    except Exception as e:
+        return {
+            "status": None,
+            "error": _format_http_probe_error(e),
+            "tls_unverified": False,
+        }
 
 
 def check_resource_via_dns(dns_ip, domain, timeout=2.5):
@@ -826,30 +959,39 @@ def check_resource_via_dns(dns_ip, domain, timeout=2.5):
 
     Шаг 1 — резолв домена напрямую через этот сервер (dns_query, с повтором
     при таймауте).
-    Шаг 2 (только при успешном резолве) — лёгкая TCP-проба к полученному IP
-    на 443/80: отвечает ли ресурс. Это отделяет «DNS вернул адрес» от «адрес
-    реально доступен».
+    Шаг 2 (только при успешном резолве) — HTTPS-проба к первому полученному IP
+    с TLS SNI и Host исходного домена. Это отделяет «ресурс открывается» от
+    типичных HTTP-ответов геоблокировки (403/451).
 
     Возвращает dict:
         {"resolved": bool, "latency_ms": float|None, "ips": [str],
-         "reachable": bool|None, "error": str|None}
-    reachable=None означает, что проба не проводилась (домен не зарезолвился).
+         "http_status": int|None,
+         "verdict": "open"|"geoblock"|"unreachable"|"no_resolve",
+         "tls_unverified": bool, "error": str|None}
     """
     q = dns_query(dns_ip, domain, timeout=timeout)
     if not q["ok"] or not q["ips"]:
         return {
             "resolved": False,
             "latency_ms": q.get("latency_ms"),
-            "ips": [],
-            "reachable": None,
+            "ips": q.get("ips") or [],
+            "http_status": None,
+            "verdict": "no_resolve",
+            "tls_unverified": False,
             "error": q.get("error") or "нет A-записи",
         }
     ip = q["ips"][0]
-    reachable = _tcp_connect_ok(ip, 443, timeout) or _tcp_connect_ok(ip, 80, timeout)
+    probe = http_probe_via_ip(ip, domain)
+    status = probe.get("status")
+    verdict = classify_http_status(status)
+    if verdict == "error":
+        verdict = "unreachable"
     return {
         "resolved": True,
         "latency_ms": q["latency_ms"],
         "ips": q["ips"],
-        "reachable": reachable,
-        "error": None,
+        "http_status": status,
+        "verdict": verdict,
+        "tls_unverified": bool(probe.get("tls_unverified")),
+        "error": probe.get("error"),
     }

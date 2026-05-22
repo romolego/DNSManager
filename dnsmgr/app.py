@@ -2863,14 +2863,20 @@ class DNSManagerApp(tk.Tk):
             """Превращает результат check_resource_via_dns в (текст, цвет)."""
             lat = r.get("latency_ms")
             lat_txt = f"{lat:.0f} мс" if isinstance(lat, (int, float)) else "?"
-            if r.get("resolved"):
-                if r.get("reachable"):
-                    return (f"{lat_txt}  ✓ открывается", "#2a7d2a")
-                # DNS вернул адрес, но сам ресурс по нему не ответил
-                return (f"{lat_txt}  ⚠ IP не отвечает", "#e65100")
-            if lat is None:
-                return ("✗ нет ответа (таймаут)", "#c0392b")
-            # сервер ответил, но домен не резолвится (NXDOMAIN/REFUSED — частая блокировка)
+            verdict = r.get("verdict")
+            if verdict == "open":
+                text = f"{lat_txt}  ✓ открывается"
+                if r.get("tls_unverified"):
+                    return (text + " (TLS без пров.)", "#e65100")
+                return (text, "#2a7d2a")
+            if verdict == "geoblock":
+                status = r.get("http_status")
+                suffix = f" ({status})" if status is not None else ""
+                return (f"{lat_txt}  ⛔ геоблок{suffix}", "#c0392b")
+            if verdict == "unreachable":
+                return ("✗ нет ответа", "#c0392b")
+            if verdict == "no_resolve":
+                return ("✗ не резолвит домен", "#c0392b")
             return ("✗ не резолвит домен", "#c0392b")
 
         def _update_test_label(pid, text, color):
@@ -2921,7 +2927,8 @@ class DNSManagerApp(tk.Tk):
                     r = check_resource_via_dns(ip, domain, timeout=2.5)
                 except Exception as e:
                     r = {"resolved": False, "latency_ms": None, "ips": [],
-                         "reachable": None, "error": str(e)}
+                         "http_status": None, "verdict": "unreachable",
+                         "tls_unverified": False, "error": str(e)}
                 text, color = _format_test_result(r)
                 with done_lock:
                     done_state["n"] += 1

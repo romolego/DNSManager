@@ -7,12 +7,16 @@
 
 import struct
 import unittest
+from unittest.mock import patch
 
 from dnsmgr.network import (
     _encode_dns_query,
     _normalize_domain,
+    _parse_http_status_line,
     _parse_dns_response,
     _skip_dns_name,
+    check_resource_via_dns,
+    classify_http_status,
 )
 
 
@@ -166,6 +170,45 @@ class SkipDnsNameTest(unittest.TestCase):
     def test_truncated_raises(self):
         with self.assertRaises(ValueError):
             _skip_dns_name(b"\x06goo", 0)  # длина 6, но байтов нет
+
+
+class ParseHttpStatusLineTest(unittest.TestCase):
+    def test_valid_status_line(self):
+        self.assertEqual(_parse_http_status_line("HTTP/1.1 403 Forbidden"), 403)
+
+    def test_garbage_returns_none(self):
+        self.assertIsNone(_parse_http_status_line("not http"))
+
+
+class ClassifyHttpStatusTest(unittest.TestCase):
+    def test_open_statuses(self):
+        for status in (200, 204, 301, 302, 401):
+            with self.subTest(status=status):
+                self.assertEqual(classify_http_status(status), "open")
+
+    def test_geoblock_statuses(self):
+        for status in (403, 451):
+            with self.subTest(status=status):
+                self.assertEqual(classify_http_status(status), "geoblock")
+
+    def test_error_statuses(self):
+        for status in (500, 0, None):
+            with self.subTest(status=status):
+                self.assertEqual(classify_http_status(status), "error")
+
+
+class CheckResourceViaDnsTest(unittest.TestCase):
+    def test_no_ip_verdict_no_resolve(self):
+        dns_result = {"ok": True, "latency_ms": 12.3, "ips": [], "error": None}
+        with patch("dnsmgr.network.dns_query", return_value=dns_result), \
+                patch("dnsmgr.network.http_probe_via_ip") as http_probe:
+            result = check_resource_via_dns("1.1.1.1", "example.com")
+
+        self.assertFalse(result["resolved"])
+        self.assertEqual(result["verdict"], "no_resolve")
+        self.assertIsNone(result["http_status"])
+        self.assertFalse(result["tls_unverified"])
+        http_probe.assert_not_called()
 
 
 if __name__ == "__main__":
