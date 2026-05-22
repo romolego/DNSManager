@@ -8,15 +8,21 @@
   - чтение/применение/сброс DNS (`get_current_dns`, `set_dns`, `reset_dns`,
     `get_dhcp_offered_dns`);
   - проверку готовности сети и реального интернета (NCSI-пробы);
-  - распознавание текущего режима DNS (`detect_dns_mode`).
+  - распознавание текущего режима DNS (`detect_dns_mode`);
+  - адресный DNS-запрос к конкретному серверу для замера времени отклика и
+    проверки, резолвит ли этот сервер заданный домен (`dns_query`,
+    `check_resource_via_dns`).
 
 Зависит только от constants и logger.
 """
 
 import json
+import os
 import re
 import socket
+import struct
 import subprocess
+import time
 
 from dnsmgr.constants import (
     DNS_RESOLVE_TIMEOUT,
@@ -628,3 +634,222 @@ def check_network_ready(adapter_name):
         return {"state": NETWORK_NO_CONNECTION, "reason": "parse_error"}
     except Exception:
         return {"state": NETWORK_NO_CONNECTION, "reason": "check_error"}
+
+
+# ── Адресный DNS-запрос: время отклика и проверка резолва домена ─────────────
+#
+# Чтобы измерить латентность конкретного DNS-сервера и проверить, резолвит ли
+# он нужный домен, нельзя пользоваться обычным socket.getaddrinfo — тот идёт
+# через системный резолвер (текущий DNS адаптера), а не через выбранный сервер.
+# Поэтому формируем «сырой» DNS-запрос (A-запись) и шлём его UDP напрямую на
+# <dns_ip>:53. Это ровно то, что делает DNS Jumper при «Проверить время
+# отклика» / «Fastest DNS», и работает без сторонних библиотек.
+#
+# encode/parse вынесены в отдельные чистые функции — их покрывают юнит-тесты,
+# а сетевой ввод/вывод изолирован в dns_query().
+
+def _normalize_domain(text):
+    """Извлекает чистое доменное имя из произвольного пользовательского ввода.
+
+    Примеры:
+        'https://chatgpt.com/foo?x=1' -> 'chatgpt.com'
+        'CHATGPT.com:443'             -> 'chatgpt.com'
+        'user@example.com'            -> 'example.com'
+        'example.com.'                -> 'example.com'
+
+    Нужна, потому что пользователь часто копирует ссылку целиком, а в DNS-запрос
+    должен идти только хост — иначе QNAME получается мусорным («https://chatgpt»),
+    и сервер отвечает ошибкой. Чистая функция.
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if "://" in s:                       # убрать схему http(s)://, и т.п.
+        s = s.split("://", 1)[1]
+    for sep in ("/", "?", "#", "\\"):    # убрать путь/параметры/якорь
+        if sep in s:
+            s = s.split(sep, 1)[0]
+    if "@" in s:                         # убрать user@ (если вставили креды)
+        s = s.split("@", 1)[1]
+    if ":" in s:                         # убрать :порт
+        s = s.split(":", 1)[0]
+    return s.strip().strip(".").lower()
+
+
+def _encode_dns_query(domain, query_id):
+    """Собирает байты DNS-запроса A-записи для домена. Чистая функция.
+
+    Заголовок: ID, flags=0x0100 (стандартный запрос, recursion desired),
+    QDCOUNT=1, остальные счётчики 0. Затем QNAME (метки), QTYPE=A(1), QCLASS=IN(1).
+    """
+    header = struct.pack(">HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
+    qname = bytearray()
+    for label in domain.strip(".").split("."):
+        if not label:
+            continue
+        try:
+            raw = label.encode("ascii")
+        except UnicodeEncodeError:
+            # IDN-домены (кириллица и т.п.) → punycode
+            raw = label.encode("idna")
+        if len(raw) > 63:
+            raise ValueError("метка домена длиннее 63 байт")
+        qname.append(len(raw))
+        qname.extend(raw)
+    qname.append(0)  # корень
+    question = bytes(qname) + struct.pack(">HH", 1, 1)  # QTYPE=A, QCLASS=IN
+    return header + question
+
+
+def _skip_dns_name(data, off):
+    """Пропускает доменное имя в DNS-сообщении (с учётом сжатия). Возвращает
+    смещение сразу после имени."""
+    while True:
+        if off >= len(data):
+            raise ValueError("обрыв имени")
+        length = data[off]
+        if length == 0:
+            return off + 1
+        if (length & 0xC0) == 0xC0:  # указатель сжатия (2 байта)
+            return off + 2
+        off += 1 + length
+
+
+def _parse_dns_response(data, query_id):
+    """Извлекает список IPv4 (A-записи) из DNS-ответа. Чистая функция.
+
+    Бросает ValueError при несовпадении ID, не-ответе или ненулевом RCODE
+    (например, NXDOMAIN — домен не резолвится этим сервером).
+    """
+    if len(data) < 12:
+        raise ValueError("слишком короткий ответ")
+    rid, flags, qd, an, ns, ar = struct.unpack(">HHHHHH", data[:12])
+    if rid != query_id:
+        raise ValueError("несовпадение ID запроса")
+    if not (flags & 0x8000):
+        raise ValueError("это не ответ")
+    rcode = flags & 0x000F
+    if rcode != 0:
+        # 3 = NXDOMAIN (домена нет), 2 = SERVFAIL, 5 = REFUSED (часто блокировка)
+        raise ValueError(f"RCODE={rcode}")
+    off = 12
+    for _ in range(qd):           # пропускаем секцию вопросов
+        off = _skip_dns_name(data, off)
+        off += 4                  # QTYPE + QCLASS
+    ips = []
+    for _ in range(an):           # секция ответов
+        off = _skip_dns_name(data, off)
+        if off + 10 > len(data):
+            break
+        rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+        off += 10
+        rdata = data[off:off + rdlen]
+        off += rdlen
+        if rtype == 1 and rdlen == 4:  # A-запись
+            ips.append(".".join(str(b) for b in rdata))
+    return ips
+
+
+def dns_query(dns_ip, domain, timeout=2.5, retries=1):
+    """Шлёт UDP DNS A-запрос напрямую на dns_ip:53 и замеряет время ответа.
+
+    Ввод домена нормализуется (схема/путь/порт отбрасываются). При таймауте
+    делается до `retries` повторов — UDP-пакеты теряются, и единичный таймаут
+    не означает, что сервер недоступен.
+
+    Возвращает dict:
+        {"ok": bool, "latency_ms": float|None, "ips": [str], "error": str|None}
+    ok=True означает: сервер ответил И ответ корректно разобран (домен
+    резолвится). ok=False с latency_ms!=None — сервер ответил, но отказал
+    (NXDOMAIN/REFUSED) либо ответ не разобран.
+    """
+    domain = _normalize_domain(domain)
+    if not domain:
+        return {"ok": False, "latency_ms": None, "ips": [], "error": "пустой домен"}
+
+    last_err = "таймаут"
+    for _attempt in range(retries + 1):
+        try:
+            query_id = int.from_bytes(os.urandom(2), "big")
+        except Exception:
+            query_id = 0x1234
+        try:
+            packet = _encode_dns_query(domain, query_id)
+        except Exception as e:
+            return {"ok": False, "latency_ms": None, "ips": [], "error": f"домен: {e}"}
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            t0 = time.perf_counter()
+            sock.sendto(packet, (dns_ip, 53))
+            data, _ = sock.recvfrom(2048)
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        except socket.timeout:
+            last_err = "таймаут"
+            continue  # повторяем (UDP мог потеряться)
+        except Exception as e:
+            return {"ok": False, "latency_ms": None, "ips": [], "error": str(e)}
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        try:
+            ips = _parse_dns_response(data, query_id)
+        except Exception as e:
+            return {"ok": False, "latency_ms": elapsed_ms, "ips": [], "error": str(e)}
+        return {"ok": True, "latency_ms": elapsed_ms, "ips": ips, "error": None}
+
+    return {"ok": False, "latency_ms": None, "ips": [], "error": last_err}
+
+
+def _tcp_connect_ok(ip, port, timeout=2.0):
+    """True, если до ip:port удаётся установить TCP-соединение."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((ip, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def check_resource_via_dns(dns_ip, domain, timeout=2.5):
+    """Проверяет, откроется ли `domain` через конкретный DNS-сервер `dns_ip`.
+
+    Шаг 1 — резолв домена напрямую через этот сервер (dns_query, с повтором
+    при таймауте).
+    Шаг 2 (только при успешном резолве) — лёгкая TCP-проба к полученному IP
+    на 443/80: отвечает ли ресурс. Это отделяет «DNS вернул адрес» от «адрес
+    реально доступен».
+
+    Возвращает dict:
+        {"resolved": bool, "latency_ms": float|None, "ips": [str],
+         "reachable": bool|None, "error": str|None}
+    reachable=None означает, что проба не проводилась (домен не зарезолвился).
+    """
+    q = dns_query(dns_ip, domain, timeout=timeout)
+    if not q["ok"] or not q["ips"]:
+        return {
+            "resolved": False,
+            "latency_ms": q.get("latency_ms"),
+            "ips": [],
+            "reachable": None,
+            "error": q.get("error") or "нет A-записи",
+        }
+    ip = q["ips"][0]
+    reachable = _tcp_connect_ok(ip, 443, timeout) or _tcp_connect_ok(ip, 80, timeout)
+    return {
+        "resolved": True,
+        "latency_ms": q["latency_ms"],
+        "ips": q["ips"],
+        "reachable": reachable,
+        "error": None,
+    }

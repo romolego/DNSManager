@@ -56,6 +56,7 @@ from dnsmgr.logger import app_logger
 from dnsmgr.monitor import HealthMonitor, NetworkChangeWatcher
 from dnsmgr.network import (
     check_network_ready,
+    check_resource_via_dns,
     detect_dns_mode,
     filter_suitable_adapters,
     flush_dns_cache,
@@ -2441,12 +2442,31 @@ class DNSManagerApp(tk.Tk):
         work_profiles = [dict(p) for p in self._dns_profiles]
         work_bpr = tk.IntVar(value=self.settings.get("dns_buttons_per_row", DEFAULT_DNS_BUTTONS_PER_ROW))
 
+        # Состояние «лаборатории тестирования DNS» (время отклика + доступность
+        # домена). Результаты привязаны к id профиля, а не к индексу — чтобы
+        # перестановка/редактирование строк не путали показания.
+        test_results = {}        # profile_id -> (text, color)
+        result_labels = {}       # profile_id -> ttk.Label (живёт между перестроениями)
+        test_state = {"busy": False}
+        var_test_domain = tk.StringVar(value="google.com")
+
         # ── Кнопок в ряду ──
         bpr_frame = ttk.Frame(dialog)
         bpr_frame.pack(fill=tk.X, padx=15, pady=(12, 6))
         ttk.Label(bpr_frame, text="Кнопок в ряду:").pack(side=tk.LEFT)
         bpr_spin = ttk.Spinbox(bpr_frame, from_=1, to=5, width=4, textvariable=work_bpr)
         bpr_spin.pack(side=tk.LEFT, padx=(6, 0))
+
+        # ── Панель проверки DNS: время отклика + откроется ли домен ──
+        test_frame = ttk.Frame(dialog)
+        test_frame.pack(fill=tk.X, padx=15, pady=(0, 4))
+        ttk.Label(test_frame, text="Проверить домен:").pack(side=tk.LEFT)
+        ent_test_domain = ttk.Entry(test_frame, textvariable=var_test_domain, width=22)
+        ent_test_domain.pack(side=tk.LEFT, padx=(6, 6))
+        btn_test = ttk.Button(test_frame, text="Проверить")
+        btn_test.pack(side=tk.LEFT)
+        lbl_test_status = ttk.Label(test_frame, text="", foreground="#555", font=("Segoe UI", 9))
+        lbl_test_status.pack(side=tk.LEFT, padx=(8, 0))
 
         # ── Список профилей ──
         list_outer = ttk.Frame(dialog)
@@ -2495,27 +2515,40 @@ class DNSManagerApp(tk.Tk):
         def _rebuild_list():
             for w in list_frame.winfo_children():
                 w.destroy()
-            # Заголовок. Колонки «Тип» в новой модели нет: тип профиля —
-            # внутреннее техническое поле и пользователю не показывается.
-            # Признак служебного geohide-профиля передаётся пометкой ★ рядом
-            # с названием.
-            hdr = ttk.Frame(list_frame)
-            hdr.pack(fill=tk.X, padx=4, pady=(4, 2))
-            ttk.Label(hdr, text="#", width=3, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
-            ttk.Label(hdr, text="Название", width=20, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
-            ttk.Label(hdr, text="Основной DNS", width=16, anchor=tk.CENTER, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
-            ttk.Label(hdr, text="Резервный DNS", width=16, anchor=tk.CENTER, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+            result_labels.clear()  # старые виджеты уничтожены — ссылки больше не валидны
+            bold = ("Segoe UI", 9, "bold")
+            reg = ("Segoe UI", 9)
+
+            # Единая grid-сетка для заголовка и строк — гарантирует ровные
+            # колонки (раньше pack со side=LEFT/RIGHT «разъезжался», когда
+            # блок кнопок менял ширину от строки к строке). Признак служебного
+            # geohide-профиля — пометка ★, приоритетной (быстрой) кнопки — ⚡,
+            # обе у названия, чтобы не ломать выравнивание блока кнопок.
+            list_frame.columnconfigure(0, minsize=30)    # #
+            list_frame.columnconfigure(1, minsize=160)   # Название
+            list_frame.columnconfigure(2, minsize=125)   # Основной DNS
+            list_frame.columnconfigure(3, minsize=125)   # Резервный DNS
+            list_frame.columnconfigure(4, minsize=185, weight=1)  # Результат
+            list_frame.columnconfigure(5, minsize=110)   # Кнопки
+
+            # ── Заголовок ──
+            ttk.Label(list_frame, text="#", font=bold).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
+            ttk.Label(list_frame, text="Название", font=bold).grid(row=0, column=1, sticky="w", padx=4, pady=(4, 2))
+            ttk.Label(list_frame, text="Основной DNS", font=bold).grid(row=0, column=2, sticky="w", padx=4, pady=(4, 2))
+            ttk.Label(list_frame, text="Резервный DNS", font=bold).grid(row=0, column=3, sticky="w", padx=4, pady=(4, 2))
+            ttk.Label(list_frame, text="Результат", font=bold).grid(row=0, column=4, sticky="w", padx=4, pady=(4, 2))
 
             for idx, profile in enumerate(work_profiles):
-                row = ttk.Frame(list_frame)
-                row.pack(fill=tk.X, padx=4, pady=1)
+                r = idx + 1
+                ttk.Label(list_frame, text=str(idx + 1), font=reg).grid(row=r, column=0, sticky="w", padx=4, pady=1)
 
-                ttk.Label(row, text=str(idx + 1), width=3, font=("Segoe UI", 9)).pack(side=tk.LEFT)
                 name_text = profile["name"]
                 if profile.get("type") == "geohide":
                     name_text = "★ " + name_text
-                name_lbl = ttk.Label(row, text=name_text, width=20, font=("Segoe UI", 9))
-                name_lbl.pack(side=tk.LEFT)
+                if idx == 0:
+                    name_text += "  ⚡"   # вынесен на быструю кнопку главного окна
+                name_lbl = ttk.Label(list_frame, text=name_text, font=reg)
+                name_lbl.grid(row=r, column=1, sticky="w", padx=4, pady=1)
                 if profile.get("type") == "geohide":
                     name_lbl.bind(
                         "<Enter>",
@@ -2525,26 +2558,44 @@ class DNSManagerApp(tk.Tk):
                         ),
                     )
                     name_lbl.bind("<Leave>", _hide_tooltip)
-                ttk.Label(row, text=profile.get("primary", ""), width=16, anchor=tk.CENTER, font=("Segoe UI", 9)).pack(side=tk.LEFT)
-                ttk.Label(row, text=profile.get("secondary", ""), width=16, anchor=tk.CENTER, font=("Segoe UI", 9)).pack(side=tk.LEFT)
-
-                btn_box = ttk.Frame(row)
-                btn_box.pack(side=tk.RIGHT)
-                if idx == 0:
-                    ttk.Label(btn_box, text="Быстрая кнопка", font=("Segoe UI", 8), foreground="#555").pack(
-                        side=tk.LEFT, padx=(0, 6)
+                elif idx == 0:
+                    name_lbl.bind(
+                        "<Enter>",
+                        lambda e: _show_tooltip(e, "Профиль вынесен на быструю кнопку главного окна"),
                     )
+                    name_lbl.bind("<Leave>", _hide_tooltip)
+
+                ttk.Label(list_frame, text=profile.get("primary", ""), font=reg).grid(row=r, column=2, sticky="w", padx=4, pady=1)
+                ttk.Label(list_frame, text=profile.get("secondary", ""), font=reg).grid(row=r, column=3, sticky="w", padx=4, pady=1)
+
+                # Колонка результата теста (время отклика / доступность домена).
+                pid = profile["id"]
+                rtext, rcolor = test_results.get(pid, ("", "#555"))
+                res_lbl = ttk.Label(list_frame, text=rtext, foreground=rcolor, font=reg)
+                res_lbl.grid(row=r, column=4, sticky="w", padx=4, pady=1)
+                result_labels[pid] = res_lbl
+
+                # Блок кнопок: ровно 4 слота (▲ ▼ ✎ ✖); ненужные слоты —
+                # пустые заглушки той же ширины, чтобы кнопки строк выровнялись.
+                btn_box = ttk.Frame(list_frame)
+                btn_box.grid(row=r, column=5, sticky="e", padx=4, pady=1)
                 if idx > 0:
                     ttk.Button(btn_box, text="▲", width=2,
-                               command=lambda i=idx: (_swap(i, i - 1), _rebuild_list())).pack(side=tk.LEFT, padx=1)
+                               command=lambda i=idx: (_swap(i, i - 1), _rebuild_list())).grid(row=0, column=0, padx=1)
+                else:
+                    ttk.Label(btn_box, text="", width=2).grid(row=0, column=0, padx=1)
                 if idx < len(work_profiles) - 1:
                     ttk.Button(btn_box, text="▼", width=2,
-                               command=lambda i=idx: (_swap(i, i + 1), _rebuild_list())).pack(side=tk.LEFT, padx=1)
+                               command=lambda i=idx: (_swap(i, i + 1), _rebuild_list())).grid(row=0, column=1, padx=1)
+                else:
+                    ttk.Label(btn_box, text="", width=2).grid(row=0, column=1, padx=1)
                 ttk.Button(btn_box, text="✎", width=2,
-                           command=lambda i=idx: _edit_profile(i)).pack(side=tk.LEFT, padx=1)
+                           command=lambda i=idx: _edit_profile(i)).grid(row=0, column=2, padx=1)
                 if len(work_profiles) > 1:
                     ttk.Button(btn_box, text="✖", width=2,
-                               command=lambda i=idx: (_delete(i), _rebuild_list())).pack(side=tk.LEFT, padx=1)
+                               command=lambda i=idx: (_delete(i), _rebuild_list())).grid(row=0, column=3, padx=1)
+                else:
+                    ttk.Label(btn_box, text="", width=2).grid(row=0, column=3, padx=1)
 
         def _swap(i, j):
             work_profiles[i], work_profiles[j] = work_profiles[j], work_profiles[i]
@@ -2806,6 +2857,97 @@ class DNSManagerApp(tk.Tk):
             btn_fr.grid(row=grid_row, column=0, columnspan=2, pady=(10, 0))
             ttk.Button(btn_fr, text="Сохранить", command=_save_ed).pack(side=tk.LEFT, padx=(0, 6))
             ttk.Button(btn_fr, text="Отменить", command=ed.destroy).pack(side=tk.LEFT)
+
+        # ── Логика проверки (время отклика + доступность домена) ──
+        def _format_test_result(r):
+            """Превращает результат check_resource_via_dns в (текст, цвет)."""
+            lat = r.get("latency_ms")
+            lat_txt = f"{lat:.0f} мс" if isinstance(lat, (int, float)) else "?"
+            if r.get("resolved"):
+                if r.get("reachable"):
+                    return (f"{lat_txt}  ✓ открывается", "#2a7d2a")
+                # DNS вернул адрес, но сам ресурс по нему не ответил
+                return (f"{lat_txt}  ⚠ IP не отвечает", "#e65100")
+            if lat is None:
+                return ("✗ нет ответа (таймаут)", "#c0392b")
+            # сервер ответил, но домен не резолвится (NXDOMAIN/REFUSED — частая блокировка)
+            return ("✗ не резолвит домен", "#c0392b")
+
+        def _update_test_label(pid, text, color):
+            test_results[pid] = (text, color)
+            lbl = result_labels.get(pid)
+            if lbl is not None:
+                try:
+                    lbl.configure(text=text, foreground=color)
+                except tk.TclError:
+                    pass
+
+        def _test_ip_for_profile(profile):
+            """IP, по которому проверять профиль. Для geohide берём актуальный
+            резолв dns.geohide.ru (geohide_known_ips), а не статичный резерв в
+            таблице — иначе устаревший адрес даёт ложный таймаут."""
+            if profile.get("type") == "geohide" and self.geohide_known_ips:
+                return self.geohide_known_ips[0] or profile.get("primary", "")
+            return profile.get("primary", "")
+
+        def _run_test():
+            if test_state["busy"]:
+                return
+            domain = var_test_domain.get().strip() or "google.com"
+            snapshot = [(p["id"], _test_ip_for_profile(p)) for p in work_profiles]
+            snapshot = [(pid, ip) for pid, ip in snapshot if ip]
+            if not snapshot:
+                lbl_test_status.configure(text="Нет профилей для проверки", foreground="#c0392b")
+                return
+            test_state["busy"] = True
+            try:
+                btn_test.configure(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+            lbl_test_status.configure(text=f"Проверка «{domain}»…", foreground="#555")
+            for pid, _ip in snapshot:
+                _update_test_label(pid, "…", "#888")
+            app_logger.info(f"Проверка DNS-серверов по домену: {domain}")
+
+            total = len(snapshot)
+            done_state = {"n": 0}
+            done_lock = threading.Lock()
+
+            def _probe(pid, ip):
+                # Каждый сервер проверяется в своём потоке — все параллельно,
+                # иначе при таймаутах последовательный прогон занял бы десятки
+                # секунд. Обновление UI — строго через dialog.after.
+                try:
+                    r = check_resource_via_dns(ip, domain, timeout=2.5)
+                except Exception as e:
+                    r = {"resolved": False, "latency_ms": None, "ips": [],
+                         "reachable": None, "error": str(e)}
+                text, color = _format_test_result(r)
+                with done_lock:
+                    done_state["n"] += 1
+                    d = done_state["n"]
+                try:
+                    dialog.after(0, lambda p=pid, t=text, c=color: _update_test_label(p, t, c))
+                    dialog.after(0, lambda dd=d: lbl_test_status.configure(
+                        text=f"Проверка «{domain}»… {dd}/{total}", foreground="#555"))
+                    if d >= total:
+                        dialog.after(0, _finish)
+                except (tk.TclError, RuntimeError):
+                    pass
+
+            def _finish():
+                test_state["busy"] = False
+                try:
+                    btn_test.configure(state=tk.NORMAL)
+                    lbl_test_status.configure(text="Готово", foreground="#2a7d2a")
+                except tk.TclError:
+                    pass
+
+            for pid, ip in snapshot:
+                threading.Thread(target=_probe, args=(pid, ip), daemon=True).start()
+
+        btn_test.configure(command=_run_test)
+        ent_test_domain.bind("<Return>", lambda _e: _run_test())
 
         _rebuild_list()
 
