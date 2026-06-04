@@ -157,6 +157,11 @@ class HealthMonitor:
         # объявлять «внешнее изменение DNS».
         self._consecutive_empty_dns_reads = 0
         self._EMPTY_DNS_READ_THRESHOLD = 2
+        # Флаг: после выхода из сна Windows мог откатить статический DNS на DHCP,
+        # и нужно тихо переставить целевой профиль обратно — но только когда сеть
+        # реально поднимется (шлюз). Держится между тиками, пока переустановка не
+        # удастся или не станет ненужной. См. _reapply_desired_after_resume.
+        self._reapply_pending = False
 
     def start(self):
         with self._lock:
@@ -166,6 +171,7 @@ class HealthMonitor:
             self._running = True
             self._network_waiting = False
             self._last_net_state = None
+            self._reapply_pending = False
             self._thread = threading.Thread(target=self._check_loop, daemon=True)
             self._thread.start()
             app_logger.info("Мониторинг DNS запущен")
@@ -297,6 +303,119 @@ class HealthMonitor:
             return False
         except Exception:
             return False
+
+    def _apply_desired_with_retries(self, target, attempts=3):
+        """Применяет целевой DNS-профиль с несколькими попытками и проверкой,
+        что он реально «прижился» (фактический режим стал целевым).
+
+        Нужно, потому что сразу после выхода из сна адаптер бывает в переходном
+        состоянии: netsh формально отрабатывает, но статический DNS не
+        закрепляется. Возвращает True при подтверждённом успехе.
+        """
+        primary = target.get("primary")
+        secondary = target.get("secondary")
+        if target.get("type") == "geohide":
+            ips, used_fallback = resolve_geohide()
+            if not used_fallback:
+                self.app.geohide_known_ips = list(ips)
+                self.app.settings["geohide_resolved_ips"] = self.app.geohide_known_ips
+                save_settings(self.app.settings)
+            primary = ips[0] if ips else GEOHIDE_FALLBACK_IPS[0]
+            secondary = ips[1] if len(ips) > 1 else (
+                GEOHIDE_FALLBACK_IPS[1] if len(GEOHIDE_FALLBACK_IPS) > 1 else None
+            )
+        if not primary:
+            return False
+
+        for _i in range(attempts):
+            if self._stop_event.is_set():
+                return False
+            res = self.app._apply_dns_set(primary, secondary)
+            if res.get("success"):
+                flush_dns_cache()
+                self._stop_event.wait(1)  # дать DNS «осесть» перед контрольным чтением
+                dns_info = get_current_dns(self.app.current_adapter)
+                actual_pid, _ = detect_dns_mode(
+                    dns_info["servers"], self.app.geohide_known_ips,
+                    dns_info.get("is_dhcp", False), dns_profiles=self.app._dns_profiles
+                )
+                if actual_pid == self.app.desired_mode:
+                    return True
+            # не прижилось — короткая пауза и повтор
+            self._stop_event.wait(2)
+        return False
+
+    def _reapply_desired_after_resume(self):
+        """Тихо возвращает целевой DNS после выхода из сна.
+
+        Возвращает True, если переустановка больше не нужна (готово или
+        неприменимо) — тогда вызывающая сторона снимет _reapply_pending; и
+        False, если стоит повторить на следующем тике (сеть ещё не готова,
+        операция занята или применение не прижилось).
+
+        Ключевое отличие от обычной ветки «расхождение режима»: здесь сброс DNS
+        трактуется как СОБСТВЕННАЯ задача (ОС откатила после сна), а не как
+        внешнее изменение — поэтому никакого диалога и остановки мониторинга.
+        """
+        if not self.app._has_selected_dns_mode() or self.app.desired_mode == "standard":
+            return True
+        if not is_admin():
+            return True  # без прав переставить не сможем, не зацикливаемся
+        if not self.app.current_adapter:
+            return True
+
+        # Сеть ещё не поднялась (нет шлюза после сна) — ждём, повторим позже.
+        net = check_network_ready(self.app.current_adapter)
+        if net["state"] != NETWORK_READY:
+            if not self._network_waiting:
+                self._network_waiting = True
+                self.app.after(0, self.app._update_monitor_label)
+            return False
+
+        if self._network_waiting:
+            self._network_waiting = False
+            self.app.after(0, self.app._update_monitor_label)
+
+        # Уже в целевом режиме (ОС ничего не откатила) — делать нечего.
+        dns_info = get_current_dns(self.app.current_adapter)
+        actual_pid, _ = detect_dns_mode(
+            dns_info["servers"], self.app.geohide_known_ips,
+            dns_info.get("is_dhcp", False), dns_profiles=self.app._dns_profiles
+        )
+        if actual_pid == self.app.desired_mode:
+            return True
+
+        target = self.app._get_desired_profile()
+        if target is None:
+            return True
+
+        # Атомарно берём операцию: если что-то выполняется (например, ручное
+        # действие пользователя) — не вмешиваемся, повторим на следующем тике.
+        if not self.app._try_begin_operation():
+            return False
+
+        try:
+            self.app.after(0, lambda: self.app._set_buttons_state(False))
+            self.app.after(0, lambda: self.app._set_operation_step(
+                f"После сна: восстановление выбранного DNS ({target['name']})..."
+            ))
+            if self._apply_desired_with_retries(target):
+                app_logger.info(
+                    f"После выхода из сна восстановлен выбранный DNS: {target['name']}"
+                )
+                self.app.after(0, lambda: self.app._set_operation_step(
+                    f"После сна восстановлен {target['name']}", is_success=True
+                ))
+                self.app.after(0, lambda: self.app._clear_operation_delayed(4))
+                return True
+            app_logger.warn(
+                "После сна не удалось переставить выбранный DNS — повтор на следующем тике"
+            )
+            return False
+        finally:
+            self.app._end_operation()
+            self.app.after(0, lambda: self.app._set_buttons_state(True))
+            self.app.after(0, self.app._refresh_state_safe)
 
     def _try_return_to_manual_adapter(self):
         """Если у пользователя был явный выбор адаптера (manual_adapter), и сейчас
@@ -471,6 +590,13 @@ class HealthMonitor:
         if self._resume_detected:
             if not self._handle_resume():
                 return  # адаптер не найден, ждём следующего цикла
+            # Адаптер найден. Windows при пробуждении часто сбрасывает статический
+            # DNS на DHCP — ставим задачу переустановить целевой профиль, как
+            # только сеть поднимется. Сам тик завершаем: первая попытка пойдёт
+            # ниже через _reapply_pending.
+            if (self.app._has_selected_dns_mode()
+                    and self.app.desired_mode != "standard"):
+                self._reapply_pending = True
 
         # Если адаптер не задан — пробуем найти его заново (после загрузки Windows)
         if not self.app.current_adapter:
@@ -480,6 +606,16 @@ class HealthMonitor:
         if self.app.operation_in_progress:
             return
         if self.app._external_change_pending:
+            return
+
+        # Отложенная переустановка целевого DNS после выхода из сна.
+        # Выполняется ДО проверки расхождения режима, чтобы временное состояние
+        # «ОС откатила DNS на DHCP» не было ошибочно принято за внешнее изменение
+        # (которое показало бы диалог / остановило мониторинг). Метод сам ждёт
+        # готовности сети и повторяет применение, пока не приживётся.
+        if self._reapply_pending:
+            if self._reapply_desired_after_resume():
+                self._reapply_pending = False
             return
 
         # Если предыдущая авто-перепривязка увела нас с manual_adapter, и сейчас
