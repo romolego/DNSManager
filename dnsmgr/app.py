@@ -313,9 +313,16 @@ class DNSManagerApp(tk.Tk):
 
         def _on_frame_configure(event):
             self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+            # Если содержимое помещается целиком — пиннимся к верхней кромке.
+            # Иначе после изменения размеров холст мог остаться в прокрученном
+            # состоянии и показать пустые полосы сверху/снизу.
+            if not self._is_canvas_scrollable():
+                self._canvas.yview_moveto(0)
 
         def _on_canvas_configure(event):
             self._canvas.itemconfig(self._canvas_window, width=event.width)
+            if not self._is_canvas_scrollable():
+                self._canvas.yview_moveto(0)
 
         main_frame.bind("<Configure>", _on_frame_configure)
         self._canvas.bind("<Configure>", _on_canvas_configure)
@@ -661,6 +668,10 @@ class DNSManagerApp(tk.Tk):
         def _on_mousewheel_canvas(event):
             if self._is_adapter_dropdown_open():
                 return "break"
+            # Не прокручиваем, если содержимое влезает целиком — иначе tkinter
+            # всё равно сдвинет холст и обнажит пустой фон (полосы сверху/снизу).
+            if not self._is_canvas_scrollable():
+                return
             self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
         def _on_mousewheel_listbox(event):
@@ -679,11 +690,29 @@ class DNSManagerApp(tk.Tk):
         except Exception:
             return False
 
+    def _is_canvas_scrollable(self):
+        """True, если содержимое выше видимой области холста (есть что прокручивать).
+
+        yview() возвращает (first, last) — видимую долю [0..1]. Если она покрывает
+        весь диапазон (last-first ≈ 1.0), контент помещается целиком и прокрутка
+        не нужна. Используется, чтобы колесо мыши не «отрывало» содержимое и не
+        обнажало пустой фон холста на окнах, где всё влезает.
+        """
+        try:
+            first, last = self._canvas.yview()
+            return (last - first) < 0.999
+        except Exception:
+            return True
+
     def _on_adapter_combobox_mousewheel(self, event):
         """Запрещает смену адаптера колесом, оставляя прокрутку страницы."""
         # Если выпадающий список Combobox открыт, не скроллим фон —
         # это предотвращает визуальное "залипание" popdown-окна.
         if self._is_adapter_dropdown_open():
+            return "break"
+
+        # Контент влезает целиком — прокрутка не нужна (иначе пустые полосы).
+        if not self._is_canvas_scrollable():
             return "break"
 
         delta = getattr(event, "delta", 0)
