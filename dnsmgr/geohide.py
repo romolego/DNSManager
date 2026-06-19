@@ -24,6 +24,7 @@ from dnsmgr.constants import (
     LINK_FETCH_MAX_BYTES,
     LINK_FETCH_TIMEOUT,
     LINK_FETCH_USER_AGENT,
+    NO_WINDOW_FLAG,
     socket_timeout_lock,
 )
 from dnsmgr.logger import app_logger
@@ -48,7 +49,7 @@ def resolve_geohide():
         result = subprocess.run(
             ["nslookup", GEOHIDE_DOMAIN],
             capture_output=True, timeout=DNS_RESOLVE_TIMEOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=NO_WINDOW_FLAG
         )
         output = result.stdout.decode("utf-8", errors="replace")
         ip_pattern = re.compile(r'Address:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')

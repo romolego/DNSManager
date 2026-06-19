@@ -20,15 +20,108 @@ from dnsmgr.constants import (
     APPDATA_DIR,
     AUTOSTART_REG_KEY,
     AUTOSTART_REG_VALUE,
+    IS_MACOS,
+    NO_WINDOW_FLAG,
     TASK_SCHEDULER_TASK_NAME,
 )
 from dnsmgr.logger import app_logger
+
+
+# ── macOS: автозапуск через LaunchAgent ─────────────────────────────────────
+#
+# На macOS аналог HKCU\Run — пользовательский LaunchAgent: plist в
+# ~/Library/LaunchAgents, который launchd запускает при входе пользователя.
+# Автозапуск «с правами администратора» (Планировщик заданий Windows) на macOS
+# не воспроизводится напрямую и считается второстепенным — соответствующие
+# функции на macOS делают no-op.
+
+_MACOS_LAUNCH_AGENT_LABEL = "com.dnsmanager.autostart"
+
+
+def _macos_launch_agent_path():
+    return os.path.join(
+        os.path.expanduser("~/Library/LaunchAgents"),
+        f"{_MACOS_LAUNCH_AGENT_LABEL}.plist",
+    )
+
+
+def _macos_program_arguments(start_minimized):
+    """Аргументы запуска для launchd. Для .app/обычного запуска — текущий бинарь."""
+    if getattr(sys, "frozen", False):
+        args = [sys.executable]
+    else:
+        args = [sys.executable, os.path.abspath(sys.argv[0])]
+    if start_minimized:
+        args.append("--minimized")
+    return args
+
+
+def _macos_get_autostart_enabled():
+    return os.path.exists(_macos_launch_agent_path())
+
+
+def _macos_set_autostart(enabled, start_minimized=False):
+    from xml.sax.saxutils import escape as xml_escape
+    path = _macos_launch_agent_path()
+    try:
+        if enabled:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            args_xml = "".join(
+                f"      <string>{xml_escape(a)}</string>\n"
+                for a in _macos_program_arguments(start_minimized)
+            )
+            plist = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                '<plist version="1.0">\n'
+                '<dict>\n'
+                '    <key>Label</key>\n'
+                f'    <string>{_MACOS_LAUNCH_AGENT_LABEL}</string>\n'
+                '    <key>ProgramArguments</key>\n'
+                '    <array>\n'
+                f'{args_xml}'
+                '    </array>\n'
+                '    <key>RunAtLoad</key>\n'
+                '    <true/>\n'
+                '    <key>ProcessType</key>\n'
+                '    <string>Interactive</string>\n'
+                '</dict>\n'
+                '</plist>\n'
+            )
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(plist)
+            try:
+                subprocess.run(["launchctl", "load", "-w", path],
+                               capture_output=True, timeout=10)
+            except Exception:
+                pass
+            app_logger.info("Автозапуск (LaunchAgent) включён"
+                            + (" (свёрнуто)" if start_minimized else ""))
+        else:
+            if os.path.exists(path):
+                try:
+                    subprocess.run(["launchctl", "unload", "-w", path],
+                                   capture_output=True, timeout=10)
+                except Exception:
+                    pass
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            app_logger.info("Автозапуск (LaunchAgent) выключен")
+        return True
+    except Exception as e:
+        app_logger.error(f"Ошибка настройки автозапуска (macOS): {e}")
+        return False
 
 
 # ── Обычный автозапуск через HKCU\Run ───────────────────────────────────────
 
 def get_autostart_enabled():
     """Проверяет, включён ли автозапуск в реестре."""
+    if IS_MACOS:
+        return _macos_get_autostart_enabled()
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY, 0, winreg.KEY_READ)
@@ -45,6 +138,8 @@ def get_autostart_enabled():
 
 def set_autostart(enabled, start_minimized=False):
     """Включает или выключает обычный автозапуск через реестр (без прав админа)."""
+    if IS_MACOS:
+        return _macos_set_autostart(enabled, start_minimized)
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY, 0,
@@ -85,11 +180,13 @@ def _get_app_exe_path():
 
 def get_admin_task_exists():
     """Проверяет, существует ли задача DNSManagerAutostart в Планировщике."""
+    if IS_MACOS:
+        return False  # «Автозапуск с правами админа» на macOS не используется
     try:
         result = subprocess.run(
             ["schtasks", "/Query", "/TN", TASK_SCHEDULER_TASK_NAME, "/FO", "LIST"],
             capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=NO_WINDOW_FLAG
         )
         return result.returncode == 0
     except Exception:
@@ -98,6 +195,10 @@ def get_admin_task_exists():
 
 def create_admin_scheduled_task(start_minimized=False):
     """Создаёт задачу в Планировщике заданий Windows для автозапуска с наивысшими правами."""
+    if IS_MACOS:
+        # Эквивалент админ-задачи на macOS не нужен (DNS повышается per-команда).
+        # Включаем обычный LaunchAgent, чтобы галочка «автозапуск» работала.
+        return _macos_set_autostart(True, start_minimized)
     exe, script = _get_app_exe_path()
 
     if script:
@@ -114,7 +215,7 @@ def create_admin_scheduled_task(start_minimized=False):
         subprocess.run(
             ["schtasks", "/Delete", "/TN", TASK_SCHEDULER_TASK_NAME, "/F"],
             capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=NO_WINDOW_FLAG
         )
     except Exception:
         pass
@@ -181,7 +282,7 @@ def create_admin_scheduled_task(start_minimized=False):
         result = subprocess.run(
             ["schtasks", "/Create", "/TN", TASK_SCHEDULER_TASK_NAME, "/XML", xml_path, "/F"],
             capture_output=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=NO_WINDOW_FLAG
         )
 
         try:
@@ -209,11 +310,13 @@ def create_admin_scheduled_task(start_minimized=False):
 
 def delete_admin_scheduled_task():
     """Удаляет задачу автозапуска из Планировщика заданий."""
+    if IS_MACOS:
+        return True  # На macOS админ-задачи нет — удалять нечего
     try:
         result = subprocess.run(
             ["schtasks", "/Delete", "/TN", TASK_SCHEDULER_TASK_NAME, "/F"],
             capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=NO_WINDOW_FLAG
         )
         if result.returncode == 0:
             app_logger.info("Задача Планировщика заданий удалена")
@@ -350,7 +453,7 @@ def _cleanup_scheduled_tasks(current_norm):
         result = subprocess.run(
             ["schtasks", "/Query", "/TN", TASK_SCHEDULER_TASK_NAME, "/XML"],
             capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=NO_WINDOW_FLAG,
         )
     except Exception:
         return 0
@@ -377,7 +480,7 @@ def _cleanup_scheduled_tasks(current_norm):
         del_res = subprocess.run(
             ["schtasks", "/Delete", "/TN", TASK_SCHEDULER_TASK_NAME, "/F"],
             capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=NO_WINDOW_FLAG,
         )
         if del_res.returncode == 0:
             app_logger.info(
@@ -396,6 +499,8 @@ def cleanup_stale_autostart_entries():
     Поскольку приложение никогда не создаёт ярлыки в Startup-папках, ветка
     очистки ярлыков убрана — она лишь увеличивала AV-сигнатуру без пользы.
     """
+    if IS_MACOS:
+        return 0  # Чистить реестр/Планировщик на macOS нечего
     current_exe = get_current_app_exe()
     current_norm = _norm_path(current_exe)
     try:
@@ -420,6 +525,12 @@ def refresh_current_autostart_entries(settings):
     """После очистки переустанавливает канонические записи автозапуска так,
     чтобы они указывали на текущий exe. Использует уже существующую логику
     set_autostart / create_admin_scheduled_task."""
+    if IS_MACOS:
+        # На macOS не трогаем автозапуск автоматически при старте: иначе при
+        # первом запуске приложение само прописало бы себя в Login Items
+        # (defaults autostart=True). Пусть пользователь включает это явно
+        # галочкой в настройках.
+        return
     try:
         want_autostart = bool(settings.get("autostart", False))
         want_admin = bool(settings.get("autostart_admin", False))

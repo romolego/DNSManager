@@ -1,0 +1,5 @@
+# Зависимости macOS-сборки DNS Manager.
+# pystray НЕ нужен: на macOS трей отключён (см. dnsmgr/app.py).
+# tkinter входит в состав Python (python.org / setup-python), отдельно не ставится.
+Pillow>=10.0.0
+pyinstaller>=6.0.0

@@ -2,9 +2,12 @@
 /build/
 /dist/
 *.spec
+# …но macOS-spec нужен в репозитории (его использует облачная сборка)
+!DNSManager_macos.spec
 
 # Сборочное venv
 /.venv-build/
+/.venv-macos/
 
 # Python
 __pycache__/

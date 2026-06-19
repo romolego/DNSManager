@@ -27,10 +27,12 @@ import time
 
 from dnsmgr.constants import (
     DNS_RESOLVE_TIMEOUT,
+    IS_MACOS,
     LINK_FETCH_USER_AGENT,
     NETWORK_NO_CONNECTION,
     NETWORK_READY,
     NETWORK_UNSTABLE,
+    NO_WINDOW_FLAG,
     TEST_DOMAIN,
     socket_timeout_lock,
 )
@@ -48,7 +50,7 @@ def _run_powershell(ps_command, timeout=15):
     ]
     result = subprocess.run(
         cmd, capture_output=True, timeout=timeout,
-        creationflags=subprocess.CREATE_NO_WINDOW
+        creationflags=NO_WINDOW_FLAG
     )
     stdout = result.stdout.decode("utf-8", errors="replace").strip()
     stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -60,7 +62,7 @@ def _run_netsh(args, timeout=15):
     cmd = ["netsh"] + args
     result = subprocess.run(
         cmd, capture_output=True, timeout=timeout,
-        creationflags=subprocess.CREATE_NO_WINDOW
+        creationflags=NO_WINDOW_FLAG
     )
     raw = result.stdout
     for enc in ("utf-8", "cp866", "cp1251"):
@@ -78,10 +80,215 @@ def _run_netsh(args, timeout=15):
     return result.returncode, stdout, stderr
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# macOS-БЭКЕНД
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# На Windows работа с DNS идёт через netsh/PowerShell. На macOS аналоги:
+#   - networksetup — управление DNS per-«сетевой сервис» (Wi-Fi, Ethernet …);
+#   - route -n get default — активный интерфейс и шлюз;
+#   - dscacheutil / killall mDNSResponder — сброс DNS-кеша.
+#
+# Понятие «адаптер» на Windows ≈ «сетевой сервис» (network service) на macOS:
+# имя сервиса («Wi-Fi») используется везде как adapter_name.
+#
+# Изменение DNS на macOS требует прав root, поэтому set/reset выполняются через
+# `osascript … with administrator privileges` — нативный системный диалог
+# запроса пароля. Чтение DNS/маршрутов прав не требует.
+
+def _run(cmd, timeout=15):
+    """Запускает команду (POSIX), возвращает (rc, stdout, stderr) в utf-8."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        out = result.stdout.decode("utf-8", errors="replace")
+        err = result.stderr.decode("utf-8", errors="replace")
+        return result.returncode, out, err
+    except subprocess.TimeoutExpired:
+        return 1, "", "timeout"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def _sh_quote(s):
+    """Безопасное single-quote экранирование для POSIX-shell."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def _macos_run_admin(shell_cmd, timeout=120):
+    """Выполняет shell-команду с правами администратора через osascript.
+
+    Показывает нативный диалог запроса пароля macOS. Возвращает (rc, out, err).
+    Если пользователь отменил ввод пароля — rc != 0 и в err будет «-128»/«cancel».
+    """
+    escaped = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'do shell script "{escaped}" with administrator privileges'
+    return _run(["osascript", "-e", script], timeout=timeout)
+
+
+_MAC_IP_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+
+
+def _macos_list_services():
+    """Список включённых сетевых сервисов (networksetup -listallnetworkservices)."""
+    rc, out, err = _run(["networksetup", "-listallnetworkservices"], timeout=10)
+    if rc != 0:
+        return []
+    services = []
+    for line in out.splitlines()[1:]:  # первая строка — заголовок-пояснение
+        name = line.strip()
+        if not name:
+            continue
+        if name.startswith("*"):  # звёздочка = сервис отключён
+            continue
+        services.append(name)
+    return services
+
+
+def _macos_service_device_map():
+    """Возвращает dict {имя_сервиса: устройство (enX)} из listnetworkserviceorder."""
+    rc, out, err = _run(["networksetup", "-listnetworkserviceorder"], timeout=10)
+    mapping = {}
+    if rc != 0:
+        return mapping
+    name = None
+    for line in out.splitlines():
+        line = line.strip()
+        m = re.match(r"\(\d+\)\s+(.*)", line)
+        if m:
+            name = m.group(1).strip()
+            continue
+        m2 = re.search(r"Device:\s*([^\),]+)\)?", line)
+        if m2 and name:
+            mapping[name] = m2.group(1).strip()
+            name = None
+    return mapping
+
+
+def _macos_default_route():
+    """Возвращает (device, gateway) активного default-маршрута или (None, None)."""
+    rc, out, err = _run(["route", "-n", "get", "default"], timeout=5)
+    if rc != 0:
+        return None, None
+    dev = gw = None
+    md = re.search(r"interface:\s*(\S+)", out)
+    if md:
+        dev = md.group(1).strip()
+    mg = re.search(r"gateway:\s*(\S+)", out)
+    if mg:
+        gw = mg.group(1).strip()
+    return dev, gw
+
+
+def _macos_get_network_adapters():
+    services = _macos_list_services()
+    devmap = _macos_service_device_map()
+    adapters = []
+    for s in services:
+        adapters.append({
+            "name": s,
+            "description": s,
+            "index": devmap.get(s, ""),
+        })
+    return adapters
+
+
+def _macos_get_active_internet_adapter(adapters=None):
+    dev, _gw = _macos_default_route()
+    if not dev:
+        return None
+    for svc, d in _macos_service_device_map().items():
+        if d == dev:
+            return svc
+    return None
+
+
+def _macos_get_current_dns(service):
+    rc, out, err = _run(["networksetup", "-getdnsservers", service], timeout=10)
+    servers = []
+    is_dhcp = False
+    if rc == 0:
+        low = out.lower()
+        if "aren't any dns servers" in low or "any dns servers" in low:
+            is_dhcp = True
+        else:
+            for line in out.splitlines():
+                line = line.strip()
+                if _MAC_IP_RE.match(line):
+                    servers.append(line)
+            if not servers:
+                is_dhcp = True
+    return {"servers": servers, "is_dhcp": is_dhcp, "raw": out.strip()}
+
+
+def _macos_set_dns(service, primary, secondary=None):
+    servers = [primary] + ([secondary] if secondary else [])
+    quoted = " ".join(_sh_quote(s) for s in servers)
+    # Меняем DNS и тут же сбрасываем кеш — всё под одним запросом пароля.
+    cmd = (
+        f"networksetup -setdnsservers {_sh_quote(service)} {quoted}; "
+        "dscacheutil -flushcache; killall -HUP mDNSResponder"
+    )
+    rc, out, err = _macos_run_admin(cmd)
+    if rc != 0:
+        low = (err or "").lower()
+        if "-128" in (err or "") or "cancel" in low:
+            return {"success": False,
+                    "error": "Изменение DNS отменено (пароль не введён).",
+                    "access_denied": True}
+        return {"success": False, "error": f"Ошибка networksetup: {err or out}"}
+    return {"success": True}
+
+
+def _macos_reset_dns(service):
+    # «Empty» возвращает сервис к DNS, выдаваемым по DHCP (стандартный режим).
+    cmd = (
+        f"networksetup -setdnsservers {_sh_quote(service)} Empty; "
+        "dscacheutil -flushcache; killall -HUP mDNSResponder"
+    )
+    rc, out, err = _macos_run_admin(cmd)
+    if rc != 0:
+        low = (err or "").lower()
+        if "-128" in (err or "") or "cancel" in low:
+            return {"success": False,
+                    "error": "Сброс DNS отменён (пароль не введён).",
+                    "access_denied": True}
+        return {"success": False, "error": f"Ошибка networksetup: {err or out}"}
+    return {"success": True}
+
+
+def _macos_flush_dns_cache():
+    # Без прав root — best-effort, чтобы не дёргать лишний запрос пароля.
+    # Полный сброс (killall mDNSResponder) выполняется вместе с set/reset.
+    _run(["dscacheutil", "-flushcache"], timeout=8)
+    return True
+
+
+def _macos_check_network_ready(service):
+    dev, gateway = _macos_default_route()
+    if not dev:
+        return {"state": NETWORK_NO_CONNECTION, "reason": "no_route"}
+    rc, ipout, _ = _run(["ipconfig", "getifaddr", dev], timeout=5)
+    ip_addr = ipout.strip() if rc == 0 else ""
+    if not ip_addr:
+        if _check_internet_connectivity():
+            return {"state": NETWORK_READY, "ip": "?", "gateway": gateway or "?"}
+        return {"state": NETWORK_NO_CONNECTION, "reason": "no_ip"}
+    if not gateway:
+        return {"state": NETWORK_NO_CONNECTION, "reason": "no_gateway"}
+    rc2, _pout, _ = _run(["ping", "-c", "1", "-t", "2", gateway], timeout=5)
+    if rc2 == 0:
+        return {"state": NETWORK_READY, "ip": ip_addr, "gateway": gateway}
+    if _check_internet_connectivity():
+        return {"state": NETWORK_READY, "ip": ip_addr, "gateway": gateway}
+    return {"state": NETWORK_UNSTABLE, "reason": "gateway_unreachable", "gateway": gateway}
+
+
 # ── Адаптеры ────────────────────────────────────────────────────────────────
 
 def get_network_adapters():
     """Получает список сетевых адаптеров через PowerShell."""
+    if IS_MACOS:
+        return _macos_get_network_adapters()
     try:
         ps_cmd = (
             "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | "
@@ -177,6 +384,8 @@ def get_active_internet_adapter(adapters=None):
     Возвращает None, если ни один подходящий default-маршрут не найден или
     PowerShell-запрос не сработал.
     """
+    if IS_MACOS:
+        return _macos_get_active_internet_adapter(adapters)
     try:
         ps_cmd = (
             "Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 "
@@ -245,6 +454,8 @@ def select_best_adapter(adapters):
 
 def get_current_dns(adapter_name):
     """Читает текущие DNS-серверы для адаптера через netsh."""
+    if IS_MACOS:
+        return _macos_get_current_dns(adapter_name)
     try:
         returncode, output, stderr = _run_netsh(
             ["interface", "ip", "show", "dnsservers", adapter_name], timeout=10
@@ -287,6 +498,10 @@ def get_dhcp_offered_dns(adapter_name):
     Возвращает список IP (может быть пустым), либо None при ошибке/отсутствии
     данных.
     """
+    if IS_MACOS:
+        # На macOS отдельного «DHCP-предложенного DNS» поверх статического нет
+        # простого способа прочитать; функция вспомогательная — возвращаем None.
+        return None
     try:
         # Экранируем одинарную кавычку в имени адаптера для PowerShell-литерала
         # (см. также check_network_ready). Имена адаптеров с ' встречаются редко,
@@ -312,6 +527,8 @@ def get_dhcp_offered_dns(adapter_name):
 
 def set_dns(adapter_name, primary, secondary=None):
     """Устанавливает DNS-серверы для адаптера через netsh."""
+    if IS_MACOS:
+        return _macos_set_dns(adapter_name, primary, secondary)
     try:
         rc1, stdout1, stderr1 = _run_netsh(
             ["interface", "ip", "set", "dnsservers", adapter_name, "static", primary, "primary"],
@@ -342,6 +559,8 @@ def set_dns(adapter_name, primary, secondary=None):
 
 def reset_dns(adapter_name):
     """Сбрасывает DNS на автоматическое получение (DHCP)."""
+    if IS_MACOS:
+        return _macos_reset_dns(adapter_name)
     try:
         rc, stdout, stderr = _run_netsh(
             ["interface", "ip", "set", "dnsservers", adapter_name, "dhcp"],
@@ -361,11 +580,13 @@ def reset_dns(adapter_name):
 
 def flush_dns_cache():
     """Очищает системный DNS-кеш Windows (ipconfig /flushdns)."""
+    if IS_MACOS:
+        return _macos_flush_dns_cache()
     try:
         result = subprocess.run(
             ["ipconfig", "/flushdns"],
             capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=NO_WINDOW_FLAG
         )
         if result.returncode == 0:
             app_logger.info("DNS-кеш Windows очищен")
@@ -455,7 +676,7 @@ def _nslookup_resolve(domain, timeout=DNS_RESOLVE_TIMEOUT):
         result = subprocess.run(
             ["nslookup", domain],
             capture_output=True, timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=NO_WINDOW_FLAG
         )
         output = result.stdout.decode("utf-8", errors="replace")
         ip_pattern = re.compile(r'Address:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
@@ -576,6 +797,8 @@ def check_network_ready(adapter_name):
     """Проверяет базовую готовность сети: адаптер подключён, есть IP, шлюз доступен."""
     if not adapter_name:
         return {"state": NETWORK_NO_CONNECTION, "reason": "no_adapter"}
+    if IS_MACOS:
+        return _macos_check_network_ready(adapter_name)
     try:
         safe_name = adapter_name.replace("'", "''")
         ps_cmd = (
@@ -602,7 +825,7 @@ def check_network_ready(adapter_name):
         ping_result = subprocess.run(
             ["ping", "-n", "1", "-w", "2000", gateway],
             capture_output=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=NO_WINDOW_FLAG
         )
         if ping_result.returncode == 0:
             return {"state": NETWORK_READY, "ip": ip_addr, "gateway": gateway}
@@ -618,7 +841,7 @@ def check_network_ready(adapter_name):
             ping_result2 = subprocess.run(
                 ["ping", "-n", "2", "-w", "2000", gateway],
                 capture_output=True, timeout=8,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=NO_WINDOW_FLAG
             )
             if ping_result2.returncode == 0:
                 return {"state": NETWORK_READY, "ip": ip_addr, "gateway": gateway}
@@ -901,7 +1124,7 @@ def _curl_probe_via_ip(ip, domain, path, timeout, insecure=False):
             cmd,
             capture_output=True,
             timeout=timeout + 1.0,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=NO_WINDOW_FLAG,
         )
     except FileNotFoundError:
         return {"status": None, "error": "curl.exe недоступен", "tls_unverified": insecure}

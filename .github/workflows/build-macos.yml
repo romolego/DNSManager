@@ -1,0 +1,46 @@
+name: Build macOS app
+
+# Собирает DNSManager.app в облаке на macOS-раннере GitHub Actions —
+# чтобы получить готовый .app без собственного Mac.
+# Запуск: автоматически при push в ветку macos, либо вручную (workflow_dispatch).
+
+on:
+  push:
+    branches: [ macos ]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "macOS runner (macos-14 = Apple Silicon/arm64, macos-13 = Intel/x86_64)"
+        default: "macos-14"
+        type: choice
+        options: [ "macos-14", "macos-13" ]
+
+jobs:
+  build:
+    runs-on: ${{ github.event.inputs.runner || 'macos-14' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-macos.txt
+
+      - name: Build .app
+        run: pyinstaller --noconfirm --clean DNSManager_macos.spec
+
+      - name: Zip .app (preserve bundle attributes)
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent DNSManager.app DNSManager-macos.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DNSManager-macos-${{ runner.arch }}
+          path: dist/DNSManager-macos.zip
+          if-no-files-found: error

@@ -18,7 +18,13 @@ import webbrowser
 from datetime import datetime
 from tkinter import messagebox, ttk
 
-import pystray
+try:
+    import pystray
+except Exception:
+    # На macOS трей (pystray, бэкенд Cocoa) требует главного потока и pyobjc,
+    # что конфликтует с tkinter mainloop. Трей там отключён, поэтому импорт
+    # pystray не должен быть обязательным.
+    pystray = None
 from PIL import Image, ImageDraw, ImageFont
 
 from dnsmgr.autostart import (
@@ -41,6 +47,7 @@ from dnsmgr.constants import (
     DEFAULT_DNS_BUTTONS_PER_ROW,
     DNS_PROFILE_TEST_DOMAIN,
     DNS_APPLY_SETTLE_DELAY,
+    IS_MACOS,
     GEOHIDE_DOMAIN,
     GEOHIDE_FALLBACK_IPS,
     GEOHIDE_LEGACY_FALLBACK_IPS,
@@ -1043,6 +1050,11 @@ class DNSManagerApp(tk.Tk):
         return pystray.Menu(*items)
 
     def _setup_tray(self):
+        if IS_MACOS or pystray is None:
+            # На macOS трея нет (см. комментарий у импорта pystray).
+            # tray_icon остаётся None — все обращения к нему уже защищены.
+            self.tray_icon = None
+            return
         icon_image = create_tray_icon_image(64)
         self.tray_icon = pystray.Icon(
             "dns_manager",
@@ -1071,7 +1083,11 @@ class DNSManagerApp(tk.Tk):
     # ─── Окно: скрытие / показ / закрытие ─────────────────────────────────
 
     def _on_close(self):
-        if self.settings.get("close_to_tray", True):
+        # На macOS трея нет — «скрытие в трей» сделало бы окно недоступным,
+        # поэтому закрытие окна завершает приложение.
+        if IS_MACOS or self.tray_icon is None:
+            self._do_quit()
+        elif self.settings.get("close_to_tray", True):
             app_logger.info("Скрытие в трей")
             self.withdraw()
         else:
@@ -1881,6 +1897,10 @@ class DNSManagerApp(tk.Tk):
 
         # Сценарий 2: ручной запуск — окно ВСЕГДА видно
         if not self._is_autostart:
+            should_hide = False
+
+        # macOS: трея нет, скрытое окно стало бы недоступным — всегда показываем
+        if IS_MACOS:
             should_hide = False
 
         if should_hide:

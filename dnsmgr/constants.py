@@ -5,7 +5,22 @@
 """
 
 import os
+import subprocess
+import sys
 import threading
+
+# ── Платформа ────────────────────────────────────────────────────────────────
+# DNS Manager изначально написан под Windows; ветка macos добавляет поддержку
+# macOS, не ломая Windows-поведение. Эти флаги — единственный источник правды
+# о платформе для всего пакета.
+IS_WINDOWS = os.name == "nt"
+IS_MACOS = sys.platform == "darwin"
+
+# Флаг «не показывать консольное окно» существует только в Windows-сборке
+# subprocess. На macOS/Linux его нет, поэтому подставляем 0 (нейтральное
+# значение, которое subprocess.run игнорирует на POSIX). Все вызовы
+# subprocess в пакете используют именно этот флаг.
+NO_WINDOW_FLAG = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
 
 # ── Идентификация приложения ─────────────────────────────────────────────────
 APP_NAME = "DNS Manager"
@@ -109,7 +124,16 @@ NETWORK_UNSTABLE = "unstable"          # адаптер подключён, но
 NETWORK_READY = "ready"                # адаптер подключён, шлюз доступен
 
 # ── Файловые пути ────────────────────────────────────────────────────────────
-APPDATA_DIR = os.path.join(os.environ.get("APPDATA", "."), "DNSManager")
+# Каталог данных приложения зависит от платформы:
+#   Windows — %APPDATA%\DNSManager
+#   macOS   — ~/Library/Application Support/DNSManager
+#   прочее  — ~/.config/DNSManager
+if IS_WINDOWS:
+    APPDATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DNSManager")
+elif IS_MACOS:
+    APPDATA_DIR = os.path.join(os.path.expanduser("~/Library/Application Support"), "DNSManager")
+else:
+    APPDATA_DIR = os.path.join(os.path.expanduser("~/.config"), "DNSManager")
 SETTINGS_PATH = os.path.join(APPDATA_DIR, "settings.json")
 LOG_PATH = os.path.join(APPDATA_DIR, "dns_manager.log")
 MAX_LOG_LINES = 10000

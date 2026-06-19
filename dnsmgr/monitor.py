@@ -17,6 +17,7 @@ from dnsmgr.constants import (
     FAILURE_THRESHOLD,
     GEOHIDE_FALLBACK_IPS,
     HEALTH_CHECK_INTERVAL,
+    IS_MACOS,
     INTERNET_WAIT_INTERVAL,
     INTERNET_WAIT_TIMEOUT,
     MAX_RECOVERY_ATTEMPTS,
@@ -164,6 +165,12 @@ class HealthMonitor:
         self._reapply_pending = False
 
     def start(self):
+        if IS_MACOS:
+            # На macOS каждое изменение DNS требует ввода пароля (osascript
+            # admin). Фоновое автовосстановление дёргало бы системный диалог
+            # пароля в неожиданные моменты, поэтому мониторинг на macOS не
+            # запускается. Ручные действия (подключение/сброс) работают штатно.
+            return
         with self._lock:
             if self._running:
                 return
