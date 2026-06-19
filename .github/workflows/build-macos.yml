@@ -1,7 +1,8 @@
 name: Build macOS app
 
-# Собирает DNSManager.app в облаке на macOS-раннере GitHub Actions —
-# чтобы получить готовый .app без собственного Mac.
+# Собирает DNSManager.app в облаке на macOS-раннере GitHub Actions и публикует
+# его в GitHub Release с постоянной ПУБЛИЧНОЙ прямой ссылкой (её можно
+# переслать кому угодно — скачивание без логина в GitHub).
 # Запуск: автоматически при push в ветку macos, либо вручную (workflow_dispatch).
 
 on:
@@ -14,6 +15,9 @@ on:
         default: "macos-14"
         type: choice
         options: [ "macos-14", "macos-13" ]
+
+permissions:
+  contents: write   # нужно, чтобы создавать/обновлять Release
 
 jobs:
   build:
@@ -33,14 +37,30 @@ jobs:
       - name: Build .app
         run: pyinstaller --noconfirm --clean DNSManager_macos.spec
 
+      - name: Ad-hoc codesign (без Apple ID, снижает «app is damaged»)
+        run: codesign --force --deep -s - dist/DNSManager.app || true
+
       - name: Zip .app (preserve bundle attributes)
         run: |
           cd dist
-          ditto -c -k --sequesterRsrc --keepParent DNSManager.app DNSManager-macos.zip
+          ditto -c -k --sequesterRsrc --keepParent DNSManager.app DNSManager-mac.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: DNSManager-macos-${{ runner.arch }}
-          path: dist/DNSManager-macos.zip
+          path: dist/DNSManager-mac.zip
           if-no-files-found: error
+
+      - name: Publish to Release (постоянная публичная ссылка)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: macos-latest
+          name: "DNS Manager для macOS (Apple Silicon)"
+          body: |
+            Готовое приложение DNS Manager для macOS (Apple Silicon).
+            Скачать: файл DNSManager-mac.zip ниже.
+
+            Приложение не подписано Apple Developer ID. При первом запуске:
+            правый клик по DNSManager.app → «Открыть» → «Открыть».
+          files: dist/DNSManager-mac.zip
